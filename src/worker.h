@@ -208,6 +208,7 @@ typedef struct worker_st {
 #define WSCREDS(ws) (&ws->vhost->creds)
 #define WSCONFIG(ws) (ws->vhost->perm_config.config)
 #define WSPCONFIG(ws) (&ws->vhost->perm_config)
+#define WSCAMOUFLAGE(ws) (WSCONFIG(ws)->camouflage)
 	struct vhost_cfg_st *vhost;
 
 	unsigned int auth_state; /* S_AUTH */
@@ -297,6 +298,9 @@ typedef struct worker_st {
 	uint8_t master_secret[TLS_MASTER_SIZE];
 	uint8_t session_id[GNUTLS_MAX_SESSION_ID];
 	unsigned cert_auth_ok;
+
+	/* CSTP framing magic bytes (default: 'S','T','F',1; obfuscated when camouflage >= 2) */
+	uint8_t cstp_magic[4];
 	int tun_fd;
 
 	/* ban points to be sent on exit */

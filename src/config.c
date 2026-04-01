@@ -916,6 +916,17 @@ static int cfg_ini_handler(void *_ctx, const char *section, const char *name, co
 			READ_TF(config->dtls_psk);
 	} else if (strcmp(name, "match-tls-dtls-ciphers") == 0) {
 		READ_TF(config->match_dtls_and_tls);
+	} else if (strcmp(name, "camouflage") == 0) {
+		READ_NUMERIC(config->camouflage);
+		if (config->camouflage > CAMOUFLAGE_FULL) {
+			fprintf(stderr, WARNSTR"invalid camouflage level %u, clamping to %d\n",
+				config->camouflage, CAMOUFLAGE_FULL);
+			config->camouflage = CAMOUFLAGE_FULL;
+		}
+	} else if (strcmp(name, "camouflage-tunnel-url") == 0) {
+		READ_STRING(config->camouflage_tunnel_url);
+	} else if (strcmp(name, "camouflage-secret") == 0) {
+		READ_STRING(config->camouflage_secret);
 #ifdef ENABLE_COMPRESSION
 	} else if (strcmp(name, "compression") == 0) {
 		READ_TF(config->enable_compression);

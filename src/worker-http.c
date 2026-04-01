@@ -41,6 +41,9 @@
 
 #define CS_AES128_GCM "OC-DTLS1_2-AES128-GCM"
 #define CS_AES256_GCM "OC-DTLS1_2-AES256-GCM"
+/* Camouflage ciphersuite names to avoid OC-DTLS fingerprint */
+#define CS_AES128_GCM_CAMO "DTLS12-AES128-GCM"
+#define CS_AES256_GCM_CAMO "DTLS12-AES256-GCM"
 
 struct known_urls_st {
 	const char *url;
@@ -175,6 +178,7 @@ static const dtls_ciphersuite_st ciphersuites12[] = {
 static const str_st sensitve_http_headers[] = {
 	STR_ST("Cookie"),
 	STR_ST("X-DTLS-Master-Secret"),
+	STR_ST("X-D-Master-Secret"),
 	STR_ST("Authorization"),
 	{NULL, 0}
 };
@@ -427,13 +431,19 @@ void header_value_check(struct worker_st *ws, struct http_req_st *req)
 		str = (char *)value;
 
 		p = strstr(str, DTLS_PROTO_INDICATOR);
-		if (p != NULL && (p[sizeof(DTLS_PROTO_INDICATOR)-1] == 0 || p[sizeof(DTLS_PROTO_INDICATOR)-1] == ':')) {
-			/* OpenConnect DTLS setup was detected. */
-			if (WSCONFIG(ws)->dtls_psk) {
-				req->use_psk = 1;
-				req->master_secret_set = 1; /* we don't need it */
-				req->selected_ciphersuite = NULL;
-				break;
+		if (p == NULL)
+			p = strstr(str, DTLS_PROTO_INDICATOR_CAMO);
+		if (p != NULL) {
+			size_t ind_len = (strstr(str, DTLS_PROTO_INDICATOR) != NULL)
+				? sizeof(DTLS_PROTO_INDICATOR)-1 : sizeof(DTLS_PROTO_INDICATOR_CAMO)-1;
+			if (p[ind_len] == 0 || p[ind_len] == ':') {
+				/* OpenConnect DTLS setup was detected. */
+				if (WSCONFIG(ws)->dtls_psk) {
+					req->use_psk = 1;
+					req->master_secret_set = 1;
+					req->selected_ciphersuite = NULL;
+					break;
+				}
 			}
 		}
 
@@ -497,13 +507,18 @@ void header_value_check(struct worker_st *ws, struct http_req_st *req)
 		str = (char *)value;
 
 		p = strstr(str, DTLS_PROTO_INDICATOR);
-		if (p != NULL && (p[sizeof(DTLS_PROTO_INDICATOR)-1] == 0 || p[sizeof(DTLS_PROTO_INDICATOR)-1] == ':')) {
-			/* OpenConnect DTLS setup was detected. */
-			if (WSCONFIG(ws)->dtls_psk) {
-				req->use_psk = 1;
-				req->master_secret_set = 1; /* we don't need it */
-				req->selected_ciphersuite = NULL;
-				break;
+		if (p == NULL)
+			p = strstr(str, DTLS_PROTO_INDICATOR_CAMO);
+		if (p != NULL) {
+			size_t ind_len = (strstr(str, DTLS_PROTO_INDICATOR) != NULL)
+				? sizeof(DTLS_PROTO_INDICATOR)-1 : sizeof(DTLS_PROTO_INDICATOR_CAMO)-1;
+			if (p[ind_len] == 0 || p[ind_len] == ':') {
+				if (WSCONFIG(ws)->dtls_psk) {
+					req->use_psk = 1;
+					req->master_secret_set = 1;
+					req->selected_ciphersuite = NULL;
+					break;
+				}
 			}
 		}
 
@@ -610,9 +625,11 @@ void header_value_check(struct worker_st *ws, struct http_req_st *req)
 			}
 			tmplen = strlen(p);
 
-			if (strncmp(p, "webvpn=", 7) == 0) {
-				tmplen -= 7;
-				p += 7;
+			if (strncmp(p, "webvpn=", 7) == 0 ||
+			    strncmp(p, CAMOUFLAGE_COOKIE_NAME"=", sizeof(CAMOUFLAGE_COOKIE_NAME)) == 0) {
+				unsigned skip = (p[0] == 'w') ? 7 : sizeof(CAMOUFLAGE_COOKIE_NAME);
+				tmplen -= skip;
+				p += skip;
 
 				while (tmplen > 1 && c_isspace(p[tmplen - 1])) {
 					tmplen--;
@@ -641,9 +658,11 @@ void header_value_check(struct worker_st *ws, struct http_req_st *req)
 					ws->auth_state = S_AUTH_COOKIE;
 					ws->cookie_set = 1;
 				}
-			} else if (strncmp(p, "webvpncontext=", 14) == 0) {
-				p += 14;
-				tmplen -= 14;
+			} else if (strncmp(p, "webvpncontext=", 14) == 0 ||
+				   strncmp(p, CAMOUFLAGE_COOKIE_CONTEXT_NAME"=", sizeof(CAMOUFLAGE_COOKIE_CONTEXT_NAME)) == 0) {
+				unsigned skip = (p[0] == 'w') ? 14 : sizeof(CAMOUFLAGE_COOKIE_CONTEXT_NAME);
+				p += skip;
+				tmplen -= skip;
 
 				while (tmplen > 1 && c_isspace(p[tmplen - 1])) {
 					tmplen--;
@@ -765,6 +784,35 @@ static void header_check(struct http_req_st *req)
 		req->next_header = p->id;
 		return;
 	}
+
+	/* Fallback: check camouflage header names for obfuscated clients */
+	{
+		static const struct {
+			const char *name;
+			unsigned id;
+		} camo_hdrs[] = {
+			{"X-S-Accept-Encoding", HEADER_CSTP_ENCODING},
+			{"X-D-Accept-Encoding", HEADER_DTLS_ENCODING},
+			{"X-D-Master-Secret", HEADER_MASTER_SECRET},
+			{"X-D-CipherSuite", HEADER_DTLS_CIPHERSUITE},
+			{"X-D-12-CipherSuite", HEADER_DTLS12_CIPHERSUITE},
+			{"X-S-Base-MTU", HEADER_CSTP_BASE_MTU},
+			{"X-S-MTU", HEADER_CSTP_MTU},
+			{"X-S-Address-Type", HEADER_CSTP_ATYPE},
+			{"X-S-Hostname", HEADER_HOSTNAME},
+			{"X-S-Full-IPv6-Capability", HEADER_FULL_IPV6},
+			{NULL, 0}
+		};
+		unsigned ci;
+		for (ci = 0; camo_hdrs[ci].name != NULL; ci++) {
+			if (req->header.length == strlen(camo_hdrs[ci].name) &&
+			    memcmp(req->header.data, camo_hdrs[ci].name, req->header.length) == 0) {
+				req->next_header = camo_hdrs[ci].id;
+				return;
+			}
+		}
+	}
+
 	req->next_header = 0;
 }
 

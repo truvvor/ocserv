@@ -88,6 +88,21 @@
 
 #define MSS_ADJUST(x) x += TCP_HEADER_SIZE + ((ws->proto == AF_INET)?(IP_HEADER_SIZE):(IPV6_HEADER_SIZE))
 
+/* Camouflage header name helpers */
+static inline const char *hdr_cstp_prefix(worker_st *ws)
+{
+	return (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL) ? "X-S-" : "X-CSTP-";
+}
+
+static inline const char *hdr_dtls_prefix(worker_st *ws)
+{
+	return (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL) ? "X-D-" : "X-DTLS-";
+}
+
+/* Use these with cstp_printf(ws, "%s%s: value\r\n", HDR_CSTP(ws), "Name") */
+#define HDR_CSTP(ws, name) hdr_cstp_prefix(ws), name
+#define HDR_DTLS(ws, name) hdr_dtls_prefix(ws), name
+
 #define WORKER_MAINTENANCE_TIME (10.)
 
 struct worker_st *global_ws = NULL;
@@ -782,6 +797,28 @@ void vpn_server(struct worker_st *ws)
 	ocsignal(SIGALRM, handle_alarm);
 
 	global_ws = ws;
+
+	/* Initialize CSTP magic bytes */
+	if (GETCONFIG(ws)->camouflage >= CAMOUFLAGE_FULL) {
+		/* Derive obfuscated magic from camouflage secret or use random */
+		if (GETCONFIG(ws)->camouflage_secret) {
+			/* Simple derivation from secret to get deterministic magic
+			 * that both client and server can compute */
+			const char *s = GETCONFIG(ws)->camouflage_secret;
+			ws->cstp_magic[0] = s[0 % strlen(s)] ^ 0xA5;
+			ws->cstp_magic[1] = s[1 % strlen(s)] ^ 0x5A;
+			ws->cstp_magic[2] = s[2 % strlen(s)] ^ 0xC3;
+			ws->cstp_magic[3] = s[3 % strlen(s)] ^ 0x3C;
+		} else {
+			gnutls_rnd(GNUTLS_RND_NONCE, ws->cstp_magic, 4);
+		}
+	} else {
+		ws->cstp_magic[0] = 'S';
+		ws->cstp_magic[1] = 'T';
+		ws->cstp_magic[2] = 'F';
+		ws->cstp_magic[3] = 1;
+	}
+
 	if (GETCONFIG(ws)->auth_timeout) {
 		terminate_reason = REASON_SERVER_DISCONNECT;
 		alarm(GETCONFIG(ws)->auth_timeout);
@@ -834,6 +871,16 @@ void vpn_server(struct worker_st *ws)
 		ret = gnutls_priority_set(session, WSCREDS(ws)->cprio);
 		GNUTLS_FATAL_ERR(ret);
 		gnutls_session_set_ptr(session, ws);
+
+		/* When camouflage is enabled, advertise ALPN protocols to
+		 * mimic a standard HTTPS server (browsers negotiate h2/http1.1) */
+		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
+			gnutls_datum_t alpn_protos[2] = {
+				{(unsigned char *)"h2", 2},
+				{(unsigned char *)"http/1.1", 8}
+			};
+			gnutls_alpn_set_protocols(session, alpn_protos, 2, 0);
+		}
 
 		/* if we have a single vhost, avoid going through a callback to set credentials. */
 		if (!HAVE_VHOSTS(ws)) {
@@ -1290,10 +1337,16 @@ int periodic_check(worker_st * ws, struct timespec *tnow, unsigned dpd)
 		      "have not received any UDP message or DPD for long (%d secs, DPD is %d)",
 		      (int)(now - ws->last_msg_udp), dpd);
 
-		memset(ws->buffer+1, 0, data_mtu);
 		ws->buffer[0] = AC_PKT_DPD_OUT;
-
-		ret = dtls_send(DTLS_ACTIVE(ws), ws->buffer, data_mtu+1);
+		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
+			/* Random padding and random size to avoid DPD fingerprinting */
+			unsigned dpd_size = 64 + (tnow->tv_nsec % (data_mtu > 64 ? data_mtu - 64 : 1));
+			gnutls_rnd(GNUTLS_RND_NONCE, ws->buffer+1, dpd_size);
+			ret = dtls_send(DTLS_ACTIVE(ws), ws->buffer, dpd_size+1);
+		} else {
+			memset(ws->buffer+1, 0, data_mtu);
+			ret = dtls_send(DTLS_ACTIVE(ws), ws->buffer, data_mtu+1);
+		}
 		DTLS_FATAL_ERR_CMD(ret, exit_worker_reason(ws, REASON_ERROR));
 
 		if (now - ws->last_msg_udp > DPD_MAX_TRIES * dpd) {
@@ -1306,10 +1359,7 @@ int periodic_check(worker_st * ws, struct timespec *tnow, unsigned dpd)
 		oclog(ws, LOG_DEBUG,
 		      "have not received TCP DPD for long (%d secs)",
 		      (int)(now - ws->last_msg_tcp));
-		ws->buffer[0] = 'S';
-		ws->buffer[1] = 'T';
-		ws->buffer[2] = 'F';
-		ws->buffer[3] = 1;
+		memcpy(ws->buffer, ws->cstp_magic, 4);
 		ws->buffer[4] = 0;
 		ws->buffer[5] = 0;
 		ws->buffer[6] = AC_PKT_DPD_OUT;
@@ -1666,7 +1716,26 @@ static int tun_mainloop(struct worker_st *ws, struct timespec *tnow)
 			ws->tun_bytes_out += dtls_to_send.size;
 
 			dtls_to_send.data[7] = dtls_type;
-			ret = dtls_send(DTLS_ACTIVE(ws), dtls_to_send.data + 7, dtls_to_send.size + 1);
+			/* When camouflage is enabled, pad DTLS packets to random sizes
+			 * to prevent packet-size-based traffic analysis */
+			if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
+				unsigned data_mtu = DATA_MTU(ws, ws->link_mtu);
+				unsigned actual_size = dtls_to_send.size + 1;
+				if (actual_size < data_mtu) {
+					/* Pad with random data to a random size between actual and MTU */
+					unsigned pad_target = actual_size + (tnow->tv_nsec % (data_mtu - actual_size + 1));
+					if (pad_target > actual_size) {
+						gnutls_rnd(GNUTLS_RND_NONCE,
+							   dtls_to_send.data + 7 + actual_size,
+							   pad_target - actual_size);
+					}
+					ret = dtls_send(DTLS_ACTIVE(ws), dtls_to_send.data + 7, pad_target);
+				} else {
+					ret = dtls_send(DTLS_ACTIVE(ws), dtls_to_send.data + 7, actual_size);
+				}
+			} else {
+				ret = dtls_send(DTLS_ACTIVE(ws), dtls_to_send.data + 7, dtls_to_send.size + 1);
+			}
 			DTLS_FATAL_ERR_CMD(ret, exit_worker_reason(ws, REASON_ERROR));
 
 			if (ret == GNUTLS_E_LARGE_PACKET) {
@@ -1682,10 +1751,7 @@ static int tun_mainloop(struct worker_st *ws, struct timespec *tnow)
 		}
 
 		if (DTLS_ACTIVE(ws)->udp_state != UP_ACTIVE || tls_retry != 0) {
-			cstp_to_send.data[0] = 'S';
-			cstp_to_send.data[1] = 'T';
-			cstp_to_send.data[2] = 'F';
-			cstp_to_send.data[3] = 1;
+			memcpy(cstp_to_send.data, ws->cstp_magic, 4);
 			cstp_to_send.data[4] = cstp_to_send.size >> 8;
 			cstp_to_send.data[5] = cstp_to_send.size & 0xff;
 			cstp_to_send.data[6] = cstp_type;
@@ -1756,12 +1822,12 @@ static int send_routes(worker_st *ws, struct http_req_st *req,
 
 		if (ip6 != 0 && ws->full_ipv6) {
 			ret = cstp_printf(ws,
-				 "X-CSTP-Split-%s-IP6: %s\r\n",
-				 txt, routes[i]);
+				 "%s%s%s-IP6: %s\r\n",
+				 HDR_CSTP(ws, "Split-"), txt, routes[i]);
 		} else {
 			ret = cstp_printf(ws,
-				 "X-CSTP-Split-%s: %s\r\n",
-				 txt, routes[i]);
+				 "%s%s%s: %s\r\n",
+				 HDR_CSTP(ws, "Split-"), txt, routes[i]);
 		}
 		if (ret < 0)
 			return ret;
@@ -1888,11 +1954,28 @@ static int connect_handler(worker_st * ws)
 
 	cookie_authenticate_or_exit(ws);
 
-	if (strcmp(req->url, "/CSCOSSLC/tunnel") != 0) {
-		oclog(ws, LOG_INFO, "bad connect request: '%s'\n", req->url);
-		response_404(ws, 1);
-		cstp_fatal_close(ws, GNUTLS_A_ACCESS_DENIED);
-		exit_worker(ws);
+	{
+		const char *tunnel_url = "/CSCOSSLC/tunnel";
+		int url_match = 0;
+
+		if (strcmp(req->url, tunnel_url) == 0)
+			url_match = 1;
+
+		/* Accept camouflage tunnel URL */
+		if (!url_match && WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL) {
+			const char *camo_url = WSCONFIG(ws)->camouflage_tunnel_url
+				? WSCONFIG(ws)->camouflage_tunnel_url
+				: CAMOUFLAGE_TUNNEL_URL;
+			if (strcmp(req->url, camo_url) == 0)
+				url_match = 1;
+		}
+
+		if (!url_match) {
+			oclog(ws, LOG_INFO, "bad connect request: '%s'\n", req->url);
+			response_404(ws, 1);
+			cstp_fatal_close(ws, GNUTLS_A_ACCESS_DENIED);
+			exit_worker(ws);
+		}
 	}
 
 	if (WSCONFIG(ws)->network.name[0] == 0) {
@@ -1922,19 +2005,37 @@ static int connect_handler(worker_st * ws)
 	FUZZ(ws->user_config->interim_update_secs, 5, rnd);
 	FUZZ(WSCONFIG(ws)->rekey_time, 30, rnd);
 
+	/* When camouflage is enabled, randomize DPD and keepalive intervals
+	 * to make timing-based traffic analysis harder */
+	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
+		if (ws->user_config->dpd > 0)
+			FUZZ(ws->user_config->dpd, ws->user_config->dpd / 4, rnd);
+		if (ws->user_config->keepalive > 0)
+			FUZZ(ws->user_config->keepalive, ws->user_config->keepalive / 4, rnd);
+		if (ws->user_config->mobile_dpd > 0)
+			FUZZ(ws->user_config->mobile_dpd, ws->user_config->mobile_dpd / 4, rnd);
+	}
+
 	/* Connected. Turn of the alarm */
 	if (WSCONFIG(ws)->auth_timeout)
 		alarm(0);
 	http_req_deinit(ws);
 
 	cstp_cork(ws);
-	ret = cstp_puts(ws, "HTTP/1.1 200 CONNECTED\r\n");
+	/* Phase 2D: use generic "200 OK" instead of distinctive "200 CONNECTED" */
+	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+		ret = cstp_puts(ws, "HTTP/1.1 200 OK\r\n");
+	else
+		ret = cstp_puts(ws, "HTTP/1.1 200 CONNECTED\r\n");
 	SEND_ERR(ret);
 
-	ret = cstp_puts(ws, "X-CSTP-Version: 1\r\n");
+	ret = cstp_printf(ws, "%s%s: 1\r\n", HDR_CSTP(ws, "Version"));
 	SEND_ERR(ret);
 
-	ret = cstp_puts(ws, "X-CSTP-Server-Name: "PACKAGE_STRING"\r\n");
+	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT)
+		ret = cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Server-Name"), CAMOUFLAGE_SERVER_NAME);
+	else
+		ret = cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Server-Name"), PACKAGE_STRING);
 	SEND_ERR(ret);
 
 	if (req->is_mobile) {
@@ -1944,21 +2045,21 @@ static int connect_handler(worker_st * ws)
 
 	/* Notify back the client about the accepted hostname */
 	if (ws->req.hostname[0] != 0) {
-		ret = cstp_printf(ws, "X-CSTP-Hostname: %s\r\n", ws->req.hostname);
+		ret = cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Hostname"), ws->req.hostname);
 		SEND_ERR(ret);
 	}
 
 	oclog(ws, LOG_INFO, "suggesting DPD of %d secs", ws->user_config->dpd);
 	if (ws->user_config->dpd > 0) {
 		ret =
-		    cstp_printf(ws, "X-CSTP-DPD: %u\r\n",
+		    cstp_printf(ws, "%s%s: %u\r\n", HDR_CSTP(ws, "DPD"),
 			       ws->user_config->dpd);
 		SEND_ERR(ret);
 	}
 
 	if (WSCONFIG(ws)->default_domain) {
 		ret =
-		    cstp_printf(ws, "X-CSTP-Default-Domain: %s\r\n",
+		    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Default-Domain"),
 			       WSCONFIG(ws)->default_domain);
 		SEND_ERR(ret);
 	}
@@ -2011,13 +2112,13 @@ static int connect_handler(worker_st * ws)
 	if (ws->vinfo.ipv4 && req->no_ipv4 == 0) {
 		oclog(ws, LOG_INFO, "sending IPv4 %s", ws->vinfo.ipv4);
 		ret =
-		    cstp_printf(ws, "X-CSTP-Address: %s\r\n",
+		    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Address"),
 			       ws->vinfo.ipv4);
 		SEND_ERR(ret);
 
 		if (ws->user_config->ipv4_netmask) {
 			ret =
-			    cstp_printf(ws, "X-CSTP-Netmask: %s\r\n",
+			    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Netmask"),
 				       ws->user_config->ipv4_netmask);
 			SEND_ERR(ret);
 		}
@@ -2028,14 +2129,14 @@ static int connect_handler(worker_st * ws)
 		if (ws->full_ipv6 && ws->user_config->ipv6_subnet_prefix) {
 			ret =
 			    cstp_printf(ws,
-				       "X-CSTP-Address-IP6: %s/%u\r\n",
+				       "%s%s: %s/%u\r\n", HDR_CSTP(ws, "Address-IP6"),
 				       ws->vinfo.ipv6, ws->user_config->ipv6_subnet_prefix);
 			SEND_ERR(ret);
 		} else {
 			const char *net;
 
 			ret =
-			    cstp_printf(ws, "X-CSTP-Address: %s\r\n",
+			    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Address"),
 				       ws->vinfo.ipv6);
 			SEND_ERR(ret);
 
@@ -2044,7 +2145,7 @@ static int connect_handler(worker_st * ws)
 				net = ws->vinfo.ipv6;
 
 			ret =
-			    cstp_printf(ws, "X-CSTP-Netmask: %s/%u\r\n",
+			    cstp_printf(ws, "%s%s: %s/%u\r\n", HDR_CSTP(ws, "Netmask"),
 				        net, ws->user_config->ipv6_subnet_prefix);
 			SEND_ERR(ret);
 		}
@@ -2075,14 +2176,12 @@ static int connect_handler(worker_st * ws)
 		oclog(ws, LOG_INFO, "adding DNS %s", ws->user_config->dns[i]);
 		if (req->user_agent_type == AGENT_ANYCONNECT) {
 			ret =
-			    cstp_printf(ws, "X-CSTP-%s: %s\r\n",
-				       ip6 ? "DNS-IP6" : "DNS",
+			    cstp_printf(ws, "%s%s: %s\r\n",
+				       HDR_CSTP(ws, ip6 ? "DNS-IP6" : "DNS"),
 				       ws->user_config->dns[i]);
-		} else { /* openconnect does not require the split
-			  * of DNS and DNS-IP6 and only recent versions
-			  * understand the IP6 variant. */
+		} else {
 			ret =
-			    cstp_printf(ws, "X-CSTP-DNS: %s\r\n",
+			    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "DNS"),
 				        ws->user_config->dns[i]);
 		}
 		SEND_ERR(ret);
@@ -2101,7 +2200,7 @@ static int connect_handler(worker_st * ws)
 
 		oclog(ws, LOG_INFO, "adding NBNS %s", ws->user_config->nbns[i]);
 		ret =
-		    cstp_printf(ws, "X-CSTP-NBNS: %s\r\n",
+		    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "NBNS"),
 			       ws->user_config->nbns[i]);
 		SEND_ERR(ret);
 	}
@@ -2120,7 +2219,7 @@ static int connect_handler(worker_st * ws)
 		oclog(ws, LOG_INFO, "adding split DNS %s",
 		      ws->user_config->split_dns[i]);
 		ret =
-		    cstp_printf(ws, "X-CSTP-Split-DNS: %s\r\n",
+		    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Split-DNS"),
 			       ws->user_config->split_dns[i]);
 		SEND_ERR(ret);
 	}
@@ -2130,7 +2229,7 @@ static int connect_handler(worker_st * ws)
 	    (ws->user_config->n_routes == 0 || ws->default_route == 0)) {
 		oclog(ws, LOG_INFO, "adding special split DNS for Apple");
 		ret =
-		    cstp_printf(ws, "X-CSTP-Split-Include-IP6: 2000::/3\r\n");
+		    cstp_printf(ws, "%s%s: 2000::/3\r\n", HDR_CSTP(ws, "Split-Include-IP6"));
 		SEND_ERR(ret);
 	}
 
@@ -2144,9 +2243,9 @@ static int connect_handler(worker_st * ws)
 	}
 
 	if (WSCONFIG(ws)->tunnel_all_dns) {
-		ret = cstp_puts(ws, "X-CSTP-Tunnel-All-DNS: true\r\n");
+		ret = cstp_printf(ws, "%s%s: true\r\n", HDR_CSTP(ws, "Tunnel-All-DNS"));
 	} else {
-		ret = cstp_puts(ws, "X-CSTP-Tunnel-All-DNS: false\r\n");
+		ret = cstp_printf(ws, "%s%s: false\r\n", HDR_CSTP(ws, "Tunnel-All-DNS"));
 	}
 	SEND_ERR(ret);
 
@@ -2154,29 +2253,26 @@ static int connect_handler(worker_st * ws)
 	SEND_ERR(ret);
 
 	ret =
-	    cstp_printf(ws, "X-CSTP-Keepalive: %u\r\n",
+	    cstp_printf(ws, "%s%s: %u\r\n", HDR_CSTP(ws, "Keepalive"),
 		       ws->user_config->keepalive);
 	SEND_ERR(ret);
 
 	if (WSCONFIG(ws)->idle_timeout > 0) {
 		ret =
-		    cstp_printf(ws,
-			       "X-CSTP-Idle-Timeout: %u\r\n",
+		    cstp_printf(ws, "%s%s: %u\r\n", HDR_CSTP(ws, "Idle-Timeout"),
 			       (unsigned)WSCONFIG(ws)->idle_timeout);
 	} else {
-		ret = cstp_puts(ws, "X-CSTP-Idle-Timeout: none\r\n");
+		ret = cstp_printf(ws, "%s%s: none\r\n", HDR_CSTP(ws, "Idle-Timeout"));
 	}
 	SEND_ERR(ret);
 
 	ret =
-	    cstp_puts(ws,
-		     "X-CSTP-Smartcard-Removal-Disconnect: true\r\n");
+	    cstp_printf(ws, "%s%s: true\r\n", HDR_CSTP(ws, "Smartcard-Removal-Disconnect"));
 	SEND_ERR(ret);
 
 	if (WSCONFIG(ws)->is_dyndns != 0) {
 		ret =
-		    cstp_puts(ws,
-			     "X-CSTP-DynDNS: true\r\n");
+		    cstp_printf(ws, "%s%s: true\r\n", HDR_CSTP(ws, "DynDNS"));
 		SEND_ERR(ret);
 	}
 
@@ -2184,23 +2280,21 @@ static int connect_handler(worker_st * ws)
 		unsigned method;
 
 		ret =
-		    cstp_printf(ws, "X-CSTP-Rekey-Time: %u\r\n",
+		    cstp_printf(ws, "%s%s: %u\r\n", HDR_CSTP(ws, "Rekey-Time"),
 			       (unsigned)(WSCONFIG(ws)->rekey_time));
 		SEND_ERR(ret);
 
-		/* if the peer isn't patched for safe renegotiation, always
-		 * require him to open a new tunnel. */
 		if (ws->session != NULL && gnutls_safe_renegotiation_status(ws->session) != 0)
 			method = WSCONFIG(ws)->rekey_method;
 		else
 			method = REKEY_METHOD_NEW_TUNNEL;
 
-		ret = cstp_printf(ws, "X-CSTP-Rekey-Method: %s\r\n",
+		ret = cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Rekey-Method"),
 				 (method ==
 				  REKEY_METHOD_SSL) ? "ssl" : "new-tunnel");
 		SEND_ERR(ret);
 	} else {
-		ret = cstp_puts(ws, "X-CSTP-Rekey-Method: none\r\n");
+		ret = cstp_printf(ws, "%s%s: none\r\n", HDR_CSTP(ws, "Rekey-Method"));
 		SEND_ERR(ret);
 	}
 
@@ -2208,7 +2302,7 @@ static int connect_handler(worker_st * ws)
 		char *url = replace_vals(ws, WSCONFIG(ws)->proxy_url);
 		if (url != NULL) {
 			ret =
-			    cstp_printf(ws, "X-CSTP-MSIE-Proxy-Pac-URL: %s\r\n",
+			    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "MSIE-Proxy-Pac-URL"),
 			       url);
 			SEND_ERR(ret);
 			talloc_free(url);
@@ -2216,24 +2310,27 @@ static int connect_handler(worker_st * ws)
 	}
 
 	if (!ws->user_config->has_session_timeout_secs) {
-		ret = cstp_puts(ws, "X-CSTP-Lease-Duration: none\r\n"
-				"X-CSTP-Session-Timeout: none\r\n");
+		ret = cstp_printf(ws, "%s%s: none\r\n%s%s: none\r\n",
+				HDR_CSTP(ws, "Lease-Duration"),
+				HDR_CSTP(ws, "Session-Timeout"));
 		SEND_ERR(ret);
 	} else {
 		time_t expiration = ws->session_start_time + ws->user_config->session_timeout_secs;
-		ret = cstp_printf(ws, "X-CSTP-Lease-Duration: %u\r\n"
-				  "X-CSTP-Session-Timeout: %u\r\n"
-				  "X-CSTP-Session-Timeout-Remaining: %ld\r\n",
+		ret = cstp_printf(ws, "%s%s: %u\r\n%s%s: %u\r\n%s%s: %ld\r\n",
+				  HDR_CSTP(ws, "Lease-Duration"),
 				  ws->user_config->session_timeout_secs,
+				  HDR_CSTP(ws, "Session-Timeout"),
 				  ws->user_config->session_timeout_secs,
+				  HDR_CSTP(ws, "Session-Timeout-Remaining"),
 				  MAX(expiration - now, 0));
 		SEND_ERR(ret);
 	}
 
-	ret = cstp_puts(ws, "X-CSTP-Disconnected-Timeout: none\r\n"
-		       "X-CSTP-Keep: true\r\n"
-		       "X-CSTP-TCP-Keepalive: true\r\n"
-		       "X-CSTP-License: accept\r\n");
+	ret = cstp_printf(ws, "%s%s: none\r\n%s%s: true\r\n%s%s: true\r\n%s%s: accept\r\n",
+		       HDR_CSTP(ws, "Disconnected-Timeout"),
+		       HDR_CSTP(ws, "Keep"),
+		       HDR_CSTP(ws, "TCP-Keepalive"),
+		       HDR_CSTP(ws, "License"));
 	SEND_ERR(ret);
 
 	for (i = 0; i < WSCONFIG(ws)->custom_header_size; i++) {
@@ -2271,33 +2368,31 @@ static int connect_handler(worker_st * ws)
 
 		if (ws->user_config->dpd > 0) {
 			ret =
-			    cstp_printf(ws, "X-DTLS-DPD: %u\r\n",
+			    cstp_printf(ws, "%s%s: %u\r\n", HDR_DTLS(ws, "DPD"),
 				       ws->user_config->dpd);
 			SEND_ERR(ret);
 		}
 
 		ret =
-		    cstp_printf(ws, "X-DTLS-Port: %u\r\n",
+		    cstp_printf(ws, "%s%s: %u\r\n", HDR_DTLS(ws, "Port"),
 			       WSPCONFIG(ws)->udp_port);
 		SEND_ERR(ret);
 
 		if (WSCONFIG(ws)->rekey_time > 0) {
 			ret =
-			    cstp_printf(ws, "X-DTLS-Rekey-Time: %u\r\n",
+			    cstp_printf(ws, "%s%s: %u\r\n", HDR_DTLS(ws, "Rekey-Time"),
 				       (unsigned)(WSCONFIG(ws)->rekey_time + 10));
 			SEND_ERR(ret);
 
-			/* This is our private extension */
 			if (WSCONFIG(ws)->rekey_method == REKEY_METHOD_SSL) {
 				ret =
-				    cstp_puts(ws,
-					     "X-DTLS-Rekey-Method: ssl\r\n");
+				    cstp_printf(ws, "%s%s: ssl\r\n", HDR_DTLS(ws, "Rekey-Method"));
 				SEND_ERR(ret);
 			}
 		}
 
 		ret =
-		    cstp_printf(ws, "X-DTLS-Keepalive: %u\r\n",
+		    cstp_printf(ws, "%s%s: %u\r\n", HDR_DTLS(ws, "Keepalive"),
 			       ws->user_config->keepalive);
 		SEND_ERR(ret);
 
@@ -2308,37 +2403,40 @@ static int connect_handler(worker_st * ws)
 		}
 
 		if (ws->req.use_psk || !WSCONFIG(ws)->dtls_legacy) {
-			oclog(ws, LOG_INFO, "X-DTLS-App-ID: %s", ws->buffer);
+			oclog(ws, LOG_INFO, "%s%s: %s", HDR_DTLS(ws, "App-ID"), ws->buffer);
 
 			ret =
-			    cstp_printf(ws, "X-DTLS-App-ID: %s\r\n",
+			    cstp_printf(ws, "%s%s: %s\r\n", HDR_DTLS(ws, "App-ID"),
 				       ws->buffer);
 			SEND_ERR(ret);
 
-			oclog(ws, LOG_INFO, "DTLS ciphersuite: "DTLS_PROTO_INDICATOR);
-			ret =
-			    cstp_printf(ws, "X-DTLS-CipherSuite: "DTLS_PROTO_INDICATOR"\r\n");
+			/* Phase 2F: use generic protocol indicator in camouflage mode */
+			{
+				const char *proto_ind = (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+					? DTLS_PROTO_INDICATOR_CAMO : DTLS_PROTO_INDICATOR;
+				oclog(ws, LOG_INFO, "DTLS ciphersuite: %s", proto_ind);
+				ret =
+				    cstp_printf(ws, "%s%s: %s\r\n", HDR_DTLS(ws, "CipherSuite"), proto_ind);
+			}
 		} else if (ws->req.selected_ciphersuite) {
-			oclog(ws, LOG_INFO, "X-DTLS-Session-ID: %s", ws->buffer);
+			oclog(ws, LOG_INFO, "%s%s: %s", HDR_DTLS(ws, "Session-ID"), ws->buffer);
 
 			ret =
-			    cstp_printf(ws, "X-DTLS-Session-ID: %s\r\n",
+			    cstp_printf(ws, "%s%s: %s\r\n", HDR_DTLS(ws, "Session-ID"),
 				       ws->buffer);
 			SEND_ERR(ret);
 
 			oclog(ws, LOG_INFO, "DTLS ciphersuite: %s",
 			      ws->req.selected_ciphersuite->oc_name);
 			ret =
-			    cstp_printf(ws, "X-DTLS%s-CipherSuite: %s\r\n",
-				        (ws->req.selected_ciphersuite->dtls12_mode!=0)?"12":"",
+			    cstp_printf(ws, "%s%s%s: %s\r\n",
+				        HDR_DTLS(ws, ""),
+				        (ws->req.selected_ciphersuite->dtls12_mode!=0)?"12-CipherSuite":"CipherSuite",
 				        ws->req.selected_ciphersuite->oc_name);
 			SEND_ERR(ret);
 
-			/* only send the X-DTLS-MTU in the legacy protocol, as there
-			 * the DTLS ciphersuite/version is negotiated and we cannot predict
-			 * the actual tunnel size */
 			ret =
-			    cstp_printf(ws, "X-DTLS-MTU: %u\r\n", DATA_MTU(ws, ws->link_mtu));
+			    cstp_printf(ws, "%s%s: %u\r\n", HDR_DTLS(ws, "MTU"), DATA_MTU(ws, ws->link_mtu));
 			SEND_ERR(ret);
 			oclog(ws, LOG_INFO, "DTLS data MTU %u", DATA_MTU(ws, ws->link_mtu));
 		}
@@ -2347,11 +2445,11 @@ static int connect_handler(worker_st * ws)
 	}
 
 	/* hack for openconnect. It uses only a single MTU value */
-	ret = cstp_printf(ws, "X-CSTP-Base-MTU: %u\r\n", ws->link_mtu);
+	ret = cstp_printf(ws, "%s%s: %u\r\n", HDR_CSTP(ws, "Base-MTU"), ws->link_mtu);
 	SEND_ERR(ret);
 	oclog(ws, LOG_INFO, "Link MTU is %u bytes", ws->link_mtu);
 
-	ret = cstp_printf(ws, "X-CSTP-MTU: %u\r\n", DATA_MTU(ws, ws->link_mtu));
+	ret = cstp_printf(ws, "%s%s: %u\r\n", HDR_CSTP(ws, "MTU"), DATA_MTU(ws, ws->link_mtu));
 	SEND_ERR(ret);
 
 	if (ws->buffer_size < ws->link_mtu+16) {
@@ -2365,7 +2463,7 @@ static int connect_handler(worker_st * ws)
 
 	if (WSCONFIG(ws)->banner) {
 		ret =
-		    cstp_printf(ws, "X-CSTP-Banner: %s\r\n",
+		    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Banner"),
 			       WSCONFIG(ws)->banner);
 		SEND_ERR(ret);
 	}
@@ -2374,7 +2472,7 @@ static int connect_handler(worker_st * ws)
 	if (ws->dtls_selected_comp) {
 		oclog(ws, LOG_INFO, "selected DTLS compression method %s\n", ws->dtls_selected_comp->name);
 		ret =
-		    cstp_printf(ws, "X-DTLS-Content-Encoding: %s\r\n",
+		    cstp_printf(ws, "%s%s: %s\r\n", HDR_DTLS(ws, "Content-Encoding"),
 			        ws->dtls_selected_comp->name);
 		SEND_ERR(ret);
 	}
@@ -2382,7 +2480,7 @@ static int connect_handler(worker_st * ws)
 	if (ws->cstp_selected_comp) {
 		oclog(ws, LOG_INFO, "selected CSTP compression method %s\n", ws->cstp_selected_comp->name);
 		ret =
-		    cstp_printf(ws, "X-CSTP-Content-Encoding: %s\r\n",
+		    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Content-Encoding"),
 			        ws->cstp_selected_comp->name);
 		SEND_ERR(ret);
 	}
@@ -2565,8 +2663,7 @@ static int parse_cstp_data(struct worker_st *ws,
 		return -1;
 	}
 
-	if (buf[0] != 'S' || buf[1] != 'T' ||
-	    buf[2] != 'F' || buf[3] != 1 || buf[7]) {
+	if (memcmp(buf, ws->cstp_magic, 4) != 0 || buf[7]) {
 		oclog(ws, LOG_INFO, "can't recognise CSTP header");
 		return -1;
 	}
@@ -2636,10 +2733,7 @@ static void syserr_cb (const char *msg)
 
 static void cstp_send_terminate(struct worker_st * ws)
 {
-	ws->buffer[0] = 'S';
-	ws->buffer[1] = 'T';
-	ws->buffer[2] = 'F';
-	ws->buffer[3] = 1;
+	memcpy(ws->buffer, ws->cstp_magic, 4);
 	ws->buffer[4] = 0;
 	ws->buffer[5] = 0;
 	ws->buffer[6] = AC_PKT_DISCONN;

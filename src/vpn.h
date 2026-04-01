@@ -50,6 +50,18 @@
 #define MAX_MSG_SIZE 16*1024
 #define DTLS_PROTO_INDICATOR "PSK-NEGOTIATE"
 
+/* Camouflage levels for DPI evasion */
+#define CAMOUFLAGE_OFF 0
+#define CAMOUFLAGE_DEFAULT 1   /* server-side only changes, compatible with stock clients */
+#define CAMOUFLAGE_FULL 2      /* full obfuscation, requires modified client */
+
+/* Obfuscated protocol indicators (used when camouflage >= CAMOUFLAGE_FULL) */
+#define DTLS_PROTO_INDICATOR_CAMO "NEGOTIATE"
+#define CAMOUFLAGE_COOKIE_NAME "session"
+#define CAMOUFLAGE_COOKIE_CONTEXT_NAME "sid"
+#define CAMOUFLAGE_TUNNEL_URL "/api/v1/session"
+#define CAMOUFLAGE_SERVER_NAME "server"
+
 
 typedef enum {
 	SOCK_TYPE_TCP,
@@ -282,6 +294,10 @@ struct cfg_st {
 	unsigned match_dtls_and_tls;
 	unsigned dtls_psk; /* whether to enable DTLS-PSK */
 	unsigned dtls_legacy; /* whether to enable DTLS-LEGACY */
+
+	unsigned camouflage; /* DPI evasion level: 0=off, 1=server-only, 2=full */
+	char *camouflage_tunnel_url; /* custom tunnel URL for camouflage mode */
+	char *camouflage_secret; /* secret for deriving obfuscation parameters */
 
 	unsigned isolate; /* whether seccomp should be enabled or not */
 

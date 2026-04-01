@@ -45,6 +45,7 @@
 #include <http_parser.h>
 
 #define VERSION_MSG "<version who=\"sg\">0.1(1)</version>\n"
+#define VERSION_MSG_CAMO "<version>1.0</version>\n"
 
 static const char oc_success_msg_head[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
 			"<config-auth client=\"vpn\" type=\"complete\">\n"
@@ -52,7 +53,14 @@ static const char oc_success_msg_head[] = "<?xml version=\"1.0\" encoding=\"UTF-
                         "<auth id=\"success\">\n"
                         "<title>SSL VPN Service</title>";
 
+static const char oc_success_msg_head_camo[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+			"<auth-response type=\"complete\">\n"
+			VERSION_MSG_CAMO
+                        "<auth id=\"success\">\n"
+                        "<title>Service</title>";
+
 #define OC_SUCCESS_MSG_FOOT "</auth></config-auth>\n"
+#define OC_SUCCESS_MSG_FOOT_CAMO "</auth></auth-response>\n"
 #define OC_SUCCESS_MSG_FOOT_PROFILE \
 			"</auth>\n" \
 			"<config client=\"vpn\" type=\"private\">" \
@@ -79,12 +87,21 @@ static const char ocv3_success_msg_foot[] = "</auth>\n";
     VERSION_MSG \
     "<auth id=\"main\">\n"
 
+#define OC_LOGIN_START_CAMO \
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" \
+    "<auth-response type=\"auth-request\">\n" \
+    VERSION_MSG_CAMO \
+    "<auth id=\"main\">\n"
+
 #define OC_LOGIN_FORM_START \
     "<message>%s</message>\n" \
     "<form method=\"post\" action=\"/auth\">\n"
 
 #define OC_LOGIN_END \
     "</form></auth>\n" "</config-auth>"
+
+#define OC_LOGIN_END_CAMO \
+    "</form></auth>\n" "</auth-response>"
 
 #define OC_LOGIN_FORM_INPUT_USER \
     "<input type=\"text\" name=\"username\" label=\"Username:\" />\n"
@@ -219,6 +236,9 @@ int get_auth_handler2(worker_st * ws, unsigned http_ver, const char *pmsg, unsig
 		else
 			login_start = OCV3_LOGIN_START;
 		login_end = OCV3_LOGIN_END;
+	} else if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL) {
+		login_start = OC_LOGIN_START_CAMO;
+		login_end = OC_LOGIN_END_CAMO;
 	} else {
 		login_start = OC_LOGIN_START;
 		login_end = OC_LOGIN_END;
@@ -242,22 +262,27 @@ int get_auth_handler2(worker_st * ws, unsigned http_ver, const char *pmsg, unsig
 
 	if (ws->sid_set != 0) {
 		char safe_id[SAFE_ID_SIZE];
+		const char *ctx_cookie = (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+			? CAMOUFLAGE_COOKIE_CONTEXT_NAME : "webvpncontext";
 
 		oc_base64_encode((char *)ws->sid, sizeof(ws->sid), (char *)context,
 			      sizeof(context));
 
 		ret =
 		    cstp_printf(ws,
-			       "Set-Cookie: webvpncontext=%s; Max-Age=%u; Secure; HttpOnly\r\n",
-			       context, (unsigned)WSCONFIG(ws)->cookie_timeout);
+			       "Set-Cookie: %s=%s; Max-Age=%u; Secure; HttpOnly\r\n",
+			       ctx_cookie, context, (unsigned)WSCONFIG(ws)->cookie_timeout);
 		if (ret < 0)
 			return -1;
 
 		oclog(ws, LOG_SENSITIVE, "sent session id: %s", calc_safe_id(ws->sid, sizeof(ws->sid), safe_id, sizeof(safe_id)));
 	} else {
+		const char *ctx_cookie = (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+			? CAMOUFLAGE_COOKIE_CONTEXT_NAME : "webvpncontext";
 		ret =
-		    cstp_puts(ws,
-			     "Set-Cookie: webvpncontext=; expires=Thu, 01 Jan 1970 22:00:00 GMT; path=/; Secure; HttpOnly\r\n");
+		    cstp_printf(ws,
+			     "Set-Cookie: %s=; expires=Thu, 01 Jan 1970 22:00:00 GMT; path=/; Secure; HttpOnly\r\n",
+			     ctx_cookie);
 		if (ret < 0)
 			return -1;
 	}
@@ -990,6 +1015,13 @@ int post_common_handler(worker_st * ws, unsigned http_ver, const char *imsg)
 		success_msg_foot = talloc_strdup(ws, ocv3_success_msg_foot);
 		success_msg_head_size = sizeof(ocv3_success_msg_head)-1;
 		success_msg_foot_size = strlen(success_msg_foot);
+	} else if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL) {
+		success_msg_head = oc_success_msg_head_camo;
+		success_msg_foot = talloc_strdup(ws, OC_SUCCESS_MSG_FOOT_CAMO);
+		if (success_msg_foot == NULL)
+			return -1;
+		success_msg_head_size = sizeof(oc_success_msg_head_camo)-1;
+		success_msg_foot_size = strlen(success_msg_foot);
 	} else {
 		success_msg_head = oc_success_msg_head;
 		success_msg_foot = NULL;
@@ -997,7 +1029,7 @@ int post_common_handler(worker_st * ws, unsigned http_ver, const char *imsg)
 		if (WSCONFIG(ws)->xml_config_file) {
 			success_msg_foot = talloc_asprintf(ws, OC_SUCCESS_MSG_FOOT_PROFILE,
 				WSCONFIG(ws)->xml_config_file, WSCONFIG(ws)->xml_config_hash);
-		} 
+		}
 #endif
 
 		if (success_msg_foot == NULL) {
@@ -1059,35 +1091,43 @@ int post_common_handler(worker_st * ws, unsigned http_ver, const char *imsg)
 	if (ret < 0)
 		goto fail;
 
-	if (ws->sid_set != 0) {
-		char context[BASE64_ENCODE_RAW_LENGTH(SID_SIZE) + 1];
-		char safe_id[SAFE_ID_SIZE];
+	{
+		const char *ctx_cookie = (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+			? CAMOUFLAGE_COOKIE_CONTEXT_NAME : "webvpncontext";
+		const char *vpn_cookie = (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+			? CAMOUFLAGE_COOKIE_NAME : "webvpn";
 
-		oc_base64_encode((char *)ws->sid, sizeof(ws->sid), (char *)context,
-			         sizeof(context));
+		if (ws->sid_set != 0) {
+			char context[BASE64_ENCODE_RAW_LENGTH(SID_SIZE) + 1];
+			char safe_id[SAFE_ID_SIZE];
+
+			oc_base64_encode((char *)ws->sid, sizeof(ws->sid), (char *)context,
+				         sizeof(context));
+
+			ret =
+			    cstp_printf(ws,
+				       "Set-Cookie: %s=%s; Secure; HttpOnly\r\n",
+				       ctx_cookie, context);
+			if (ret < 0)
+				goto fail;
+
+			oclog(ws, LOG_SENSITIVE, "sent session id: %s", calc_safe_id(ws->sid, sizeof(ws->sid), safe_id, sizeof(safe_id)));
+		}
 
 		ret =
 		    cstp_printf(ws,
-			       "Set-Cookie: webvpncontext=%s; Secure; HttpOnly\r\n",
-			       context);
+			       "Set-Cookie: %s=%s; Secure; HttpOnly\r\n",
+			       vpn_cookie, str_cookie);
 		if (ret < 0)
 			goto fail;
 
-		oclog(ws, LOG_SENSITIVE, "sent session id: %s", calc_safe_id(ws->sid, sizeof(ws->sid), safe_id, sizeof(safe_id)));
+		ret =
+		    cstp_printf(ws,
+			     "Set-Cookie: %sc=; expires=Thu, 01 Jan 1970 22:00:00 GMT; path=/; Secure; HttpOnly\r\n",
+			     vpn_cookie);
+		if (ret < 0)
+			goto fail;
 	}
-
-	ret =
-	    cstp_printf(ws,
-		       "Set-Cookie: webvpn=%s; Secure; HttpOnly\r\n",
-		       str_cookie);
-	if (ret < 0)
-		goto fail;
-
-	ret =
-	    cstp_puts(ws,
-		     "Set-Cookie: webvpnc=; expires=Thu, 01 Jan 1970 22:00:00 GMT; path=/; Secure; HttpOnly\r\n");
-	if (ret < 0)
-		goto fail;
 
 #ifdef ANYCONNECT_CLIENT_COMPAT	
 	if (WSCONFIG(ws)->xml_config_file) {
