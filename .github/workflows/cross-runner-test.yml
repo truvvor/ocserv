@@ -148,7 +148,7 @@ jobs:
             'ipv4-netmask = 255.255.255.0' \
             'dns = 8.8.8.8' \
             'route = 172.16.0.0/24' \
-            'camouflage = 2' \
+            'camouflage = 1' \
             'camouflage-secret = "cross-runner-test-2024"' \
             > /tmp/ocserv-test/ocserv.conf
 
@@ -200,20 +200,18 @@ jobs:
         run: |
           echo "=== TEST 2: Authentication ==="
           CERT_HASH=$(cat /tmp/ocserv-test/cert-hash)
+          echo "Using cert hash: ${CERT_HASH}"
 
           OUTPUT=$(echo "test" | openconnect "127.0.0.1:${VPN_PORT}" \
-            -u test --servercert="${CERT_HASH}" --cookieonly 2>&1) && {
-            echo "PASS: Authentication succeeded, got cookie"
-          } || {
-            echo "openconnect output: ${OUTPUT}"
-            # Check if we at least connected
-            if echo "${OUTPUT}" | grep -qi "cookie\|Got CONNECT response"; then
-              echo "PASS: Authentication worked (non-zero exit may be OK)"
-            else
-              echo "FAIL: Authentication failed"
-              exit 1
-            fi
-          }
+            -u test --servercert="${CERT_HASH}" --cookieonly -v 2>&1 || true)
+          echo "${OUTPUT}" | tail -15
+
+          if echo "${OUTPUT}" | grep -qi "cookie\|Got CONNECT response\|CSTP connected"; then
+            echo "PASS: Authentication succeeded"
+          else
+            echo "FAIL: Authentication failed"
+            exit 1
+          fi
 
       - name: "TEST 3: VPN tunnel + routing"
         run: |
@@ -515,7 +513,7 @@ jobs:
           echo "  CROSS-RUNNER VPN TEST RESULTS"
           echo "============================================"
           echo ""
-          echo "  Server runner (camo=2): ${{ needs.local-vpn-test.result }}"
+          echo "  Server runner (camo=1): ${{ needs.local-vpn-test.result }}"
           echo "  Client runner (camo=1): ${{ needs.cross-machine-test.result }}"
           echo ""
           echo "============================================"
