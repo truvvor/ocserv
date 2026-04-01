@@ -74,25 +74,8 @@ int cstp_uncork(worker_st *ws)
 {
 	if (ws->session) {
 #if GNUTLS_VERSION_NUMBER >= 0x030604
-		/* When camouflage is enabled, fragment the corked data into
-		 * multiple TLS records of random sizes. This prevents DPI from
-		 * fingerprinting the CONNECT response by its distinctive
-		 * single large TLS record size. We temporarily reduce the max
-		 * record size, uncork (which sends in chunks), then restore. */
-		if (WSCONFIG(ws)->camouflage >= CAMOUFLAGE_DEFAULT) {
-			int ret;
-			uint32_t rnd;
-			gnutls_rnd(GNUTLS_RND_NONCE, &rnd, sizeof(rnd));
-			/* Random max record size between 512 and 4096 bytes.
-			 * This forces GnuTLS to split the corked buffer into
-			 * multiple TLS records of varying sizes. */
-			size_t frag_size = 512 + (rnd % 3585);
-			gnutls_record_set_max_size(ws->session, frag_size);
-			ret = gnutls_record_uncork(ws->session, GNUTLS_RECORD_WAIT);
-			/* Restore full record size for data transfer */
-			gnutls_record_set_max_size(ws->session, 16384);
-			return ret;
-		}
+		/* Per-record randomization is handled by
+		 * gnutls_record_send_range in cstp_send. */
 #endif
 		return gnutls_record_uncork(ws->session, GNUTLS_RECORD_WAIT);
 	} else {

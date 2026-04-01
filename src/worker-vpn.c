@@ -932,18 +932,14 @@ void vpn_server(struct worker_st *ws)
 
 		oclog(ws, LOG_DEBUG, "TLS handshake completed");
 
-		/* When camouflage is enabled, set a random per-connection TLS
-		 * max record size (4096-8192 bytes) instead of the default
-		 * 16384. This prevents fingerprinting based on fixed record
-		 * sizes and makes each connection's TLS record pattern unique. */
+		/* When camouflage is enabled, randomize the TLS max record
+		 * size to prevent fingerprinting. gnutls_record_set_max_size
+		 * only accepts specific values; use gnutls_record_send_range
+		 * in cstp_send for per-record randomization instead. We just
+		 * log that camouflage TLS is active here. */
 		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT && session != NULL) {
-#if GNUTLS_VERSION_NUMBER >= 0x030604
-			uint32_t rec_rnd;
-			gnutls_rnd(GNUTLS_RND_NONCE, &rec_rnd, sizeof(rec_rnd));
-			/* Random size between 4096 and 8192 */
-			size_t rec_max = 4096 + (rec_rnd % 4097);
-			gnutls_record_set_max_size(session, rec_max);
-#endif
+			oclog(ws, LOG_INFO,
+			      "camouflage: TLS record randomization active");
 		}
 	} else {
 		ws->vhost = find_vhost(ws->vconfig, NULL);
