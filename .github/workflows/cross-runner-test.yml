@@ -101,35 +101,25 @@ jobs:
           echo "ip=${SERVER_IP}" >> "$GITHUB_OUTPUT"
 
       - name: Generate test certificates
+        env:
+          SERVER_IP: ${{ steps.get_ip.outputs.ip }}
         run: |
           mkdir -p /tmp/ocserv-test
           # Generate CA
           certtool --generate-privkey --outfile /tmp/ocserv-test/ca-key.pem 2>/dev/null
-          cat > /tmp/ocserv-test/ca-tmpl.cfg << 'TMPL'
-          cn = "Test CA"
-          organization = "Test"
-          serial = 1
-          expiration_days = 365
-          ca
-          signing_key
-          cert_signing_key
-          TMPL
+          printf '%s\n' 'cn = "Test CA"' 'organization = "Test"' \
+            'serial = 1' 'expiration_days = 365' 'ca' 'signing_key' \
+            'cert_signing_key' > /tmp/ocserv-test/ca-tmpl.cfg
           certtool --generate-self-signed --load-privkey /tmp/ocserv-test/ca-key.pem \
             --template /tmp/ocserv-test/ca-tmpl.cfg --outfile /tmp/ocserv-test/ca-cert.pem 2>/dev/null
 
           # Generate server cert
           certtool --generate-privkey --outfile /tmp/ocserv-test/server-key.pem 2>/dev/null
-          cat > /tmp/ocserv-test/server-tmpl.cfg << TMPL
-          cn = "${{ steps.get_ip.outputs.ip }}"
-          organization = "Test"
-          serial = 2
-          expiration_days = 365
-          signing_key
-          encryption_key
-          tls_www_server
-          dns_name = "${{ steps.get_ip.outputs.ip }}"
-          ip_address = "${{ steps.get_ip.outputs.ip }}"
-          TMPL
+          printf '%s\n' "cn = \"${SERVER_IP}\"" 'organization = "Test"' \
+            'serial = 2' 'expiration_days = 365' 'signing_key' \
+            'encryption_key' 'tls_www_server' \
+            "dns_name = \"${SERVER_IP}\"" \
+            "ip_address = \"${SERVER_IP}\"" > /tmp/ocserv-test/server-tmpl.cfg
           certtool --generate-certificate --load-privkey /tmp/ocserv-test/server-key.pem \
             --load-ca-certificate /tmp/ocserv-test/ca-cert.pem \
             --load-ca-privkey /tmp/ocserv-test/ca-key.pem \
@@ -149,39 +139,35 @@ jobs:
 
       - name: Create server config
         run: |
-          cat > /tmp/ocserv-test/ocserv.conf << 'EOF'
-          auth = "plain[/tmp/ocserv-test/passwd]"
-          tcp-port = ${{ env.VPN_PORT }}
-          udp-port = ${{ env.VPN_PORT }}
-          server-cert = /tmp/ocserv-test/server-cert.pem
-          server-key = /tmp/ocserv-test/server-key.pem
-          ca-cert = /tmp/ocserv-test/ca-cert.pem
-          max-ban-score = 0
-          isolate-workers = false
-          max-clients = 4
-          max-same-clients = 2
-          keepalive = 30
-          dpd = 60
-          try-mtu-discovery = true
-          cert-user-oid = 2.5.4.3
-          tls-priorities = "NORMAL:%SERVER_PRECEDENCE"
-          auth-timeout = 120
-          idle-timeout = 600
-          session-timeout = 86400
-          device = vpns
-          ipv4-network = 172.16.0.0/24
-          ipv4-netmask = 255.255.255.0
-          dns = 8.8.8.8
-          route = 172.16.0.0/24
-
-          # Camouflage settings
-          camouflage = 2
-          camouflage-secret = "cross-runner-test-2024"
-          camouflage-realm = "Restricted"
-          EOF
-
-          # Fix port substitution (env vars don't expand in heredoc with quotes)
-          sed -i "s|\${{ env.VPN_PORT }}|${VPN_PORT}|g" /tmp/ocserv-test/ocserv.conf
+          printf '%s\n' \
+            'auth = "plain[/tmp/ocserv-test/passwd]"' \
+            "tcp-port = ${VPN_PORT}" \
+            "udp-port = ${VPN_PORT}" \
+            'server-cert = /tmp/ocserv-test/server-cert.pem' \
+            'server-key = /tmp/ocserv-test/server-key.pem' \
+            'ca-cert = /tmp/ocserv-test/ca-cert.pem' \
+            'max-ban-score = 0' \
+            'isolate-workers = false' \
+            'max-clients = 4' \
+            'max-same-clients = 2' \
+            'keepalive = 30' \
+            'dpd = 60' \
+            'try-mtu-discovery = true' \
+            'cert-user-oid = 2.5.4.3' \
+            'tls-priorities = "NORMAL:%SERVER_PRECEDENCE"' \
+            'auth-timeout = 120' \
+            'idle-timeout = 600' \
+            'session-timeout = 86400' \
+            'device = vpns' \
+            'ipv4-network = 172.16.0.0/24' \
+            'ipv4-netmask = 255.255.255.0' \
+            'dns = 8.8.8.8' \
+            'route = 172.16.0.0/24' \
+            'camouflage = 2' \
+            'camouflage-secret = "cross-runner-test-2024"' \
+            'camouflage-realm = "Restricted"' \
+            > /tmp/ocserv-test/ocserv.conf
+          cat /tmp/ocserv-test/ocserv.conf
 
           # Create password file
           echo "test:*:$( echo -n 'test' | openssl passwd -5 -stdin )" > /tmp/ocserv-test/passwd
