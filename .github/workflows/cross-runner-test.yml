@@ -218,10 +218,11 @@ jobs:
           echo "=== TEST 3: VPN Tunnel Establishment ==="
           CERT_HASH=$(cat /tmp/ocserv-test/cert-hash)
 
-          # Start openconnect in background
-          echo "test" | echo "${SUDO_PASS}" | sudo -S openconnect "127.0.0.1:${VPN_PORT}" \
-            -u test --servercert="${CERT_HASH}" --no-dtls \
-            -b --pid-file=/tmp/oc-pid.tmp \
+          # Start openconnect in background (sudo needs password on stdin,
+          # openconnect needs "test" on stdin — use bash -c to separate them)
+          echo "${SUDO_PASS}" | sudo -S bash -c "echo test | openconnect \"127.0.0.1:${VPN_PORT}\" \
+            -u test --servercert=\"${CERT_HASH}\" --no-dtls \
+            -b --pid-file=/tmp/oc-pid.tmp" \
             2>/tmp/oc-connect.log
 
           sleep 5
@@ -475,9 +476,9 @@ jobs:
           # TEST: Establish tunnel
           echo ""
           echo "--- TEST B: VPN Tunnel ---"
-          echo "test" | echo "${SUDO_PASS}" | sudo -S openconnect "127.0.0.1:9444" \
-            -u test --servercert="${CERT_HASH2}" --no-dtls \
-            -b --pid-file=/tmp/oc-pid2.tmp 2>/tmp/oc-connect2.log
+          echo "${SUDO_PASS}" | sudo -S bash -c "echo test | openconnect 127.0.0.1:9444 \
+            -u test --servercert=${CERT_HASH2} --no-dtls \
+            -b --pid-file=/tmp/oc-pid2.tmp" 2>/tmp/oc-connect2.log
           sleep 5
 
           ip addr show | grep -E "vpns|tun" -A3 || echo "No VPN interface"
