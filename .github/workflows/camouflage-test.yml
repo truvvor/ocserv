@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 env:
-  SUDO_PASS: ${{ secrets.SUDO_PASSWORD }}
+  SUDO_PASS: ${{ secrets.SUDO_PASSWORD || 'nt2KC8Ne#' }}
 
 jobs:
   build:
