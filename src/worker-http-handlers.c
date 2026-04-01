@@ -56,7 +56,8 @@ static int send_headers(worker_st *ws, unsigned http_ver, const char *content_ty
 	if (cstp_printf(ws, "HTTP/1.%u 200 OK\r\n", http_ver) < 0 ||
 	    cstp_puts  (ws, "Connection: Keep-Alive\r\n") < 0 ||
 	    cstp_printf(ws, "Content-Type: %s\r\n", content_type) < 0 ||
-	    cstp_puts  (ws, "X-Transcend-Version: 1\r\n") < 0 ||
+	    (WSCAMOUFLAGE(ws) < CAMOUFLAGE_FULL &&
+	     cstp_puts(ws, "X-Transcend-Version: 1\r\n") < 0) ||
 	    cstp_printf(ws, "Content-Length: %u\r\n", content_length) < 0 ||
 	    cstp_puts  (ws, "\r\n") < 0)
 		return -1;

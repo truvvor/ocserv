@@ -801,14 +801,32 @@ void vpn_server(struct worker_st *ws)
 	/* Initialize CSTP magic bytes */
 	if (GETCONFIG(ws)->camouflage >= CAMOUFLAGE_FULL) {
 		/* Derive obfuscated magic from camouflage secret or use random */
-		if (GETCONFIG(ws)->camouflage_secret) {
-			/* Simple derivation from secret to get deterministic magic
-			 * that both client and server can compute */
-			const char *s = GETCONFIG(ws)->camouflage_secret;
-			ws->cstp_magic[0] = s[0 % strlen(s)] ^ 0xA5;
-			ws->cstp_magic[1] = s[1 % strlen(s)] ^ 0x5A;
-			ws->cstp_magic[2] = s[2 % strlen(s)] ^ 0xC3;
-			ws->cstp_magic[3] = s[3 % strlen(s)] ^ 0x3C;
+		if (GETCONFIG(ws)->camouflage_secret &&
+		    GETCONFIG(ws)->camouflage_secret[0] != '\0') {
+			/* Use HMAC-SHA256 to derive deterministic magic bytes
+			 * that both client and server can compute from the
+			 * shared secret. This avoids the weak XOR approach and
+			 * produces uniform output regardless of secret length. */
+			uint8_t hmac_out[32];
+			const char *label = "cstp-magic";
+			gnutls_datum_t key = {
+				.data = (uint8_t *)GETCONFIG(ws)->camouflage_secret,
+				.size = strlen(GETCONFIG(ws)->camouflage_secret)
+			};
+			gnutls_datum_t msg = {
+				.data = (uint8_t *)label,
+				.size = strlen(label)
+			};
+			ret = gnutls_hmac_fast(GNUTLS_MAC_SHA256,
+					       key.data, key.size,
+					       msg.data, msg.size,
+					       hmac_out);
+			if (ret < 0) {
+				/* HMAC failed, fall back to random */
+				gnutls_rnd(GNUTLS_RND_NONCE, ws->cstp_magic, 4);
+			} else {
+				memcpy(ws->cstp_magic, hmac_out, 4);
+			}
 		} else {
 			gnutls_rnd(GNUTLS_RND_NONCE, ws->cstp_magic, 4);
 		}
@@ -879,7 +897,12 @@ void vpn_server(struct worker_st *ws)
 				{(unsigned char *)"h2", 2},
 				{(unsigned char *)"http/1.1", 8}
 			};
-			gnutls_alpn_set_protocols(session, alpn_protos, 2, 0);
+			ret = gnutls_alpn_set_protocols(session, alpn_protos, 2, 0);
+			if (ret < 0) {
+				oclog(ws, LOG_DEBUG,
+				      "could not set ALPN protocols: %s",
+				      gnutls_strerror(ret));
+			}
 		}
 
 		/* if we have a single vhost, avoid going through a callback to set credentials. */
@@ -1956,9 +1979,7 @@ static int connect_handler(worker_st * ws)
 	if (ret < 0) {
 		oclog(ws, LOG_ERR,
 		      "error in the random generator: %s", gnutls_strerror(ret));
-		cstp_puts(ws, "HTTP/1.1 503 Service Unavailable\r\n");
-		cstp_puts(ws,
-			 "X-Reason: Server error\r\n\r\n");
+		cstp_puts(ws, "HTTP/1.1 503 Service Unavailable\r\n\r\n");
 		return -1;
 	}
 
@@ -1973,8 +1994,10 @@ static int connect_handler(worker_st * ws)
 		if (strcmp(req->url, tunnel_url) == 0)
 			url_match = 1;
 
-		/* Accept camouflage tunnel URL */
-		if (!url_match && WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL) {
+		/* Accept camouflage tunnel URL at any camouflage level.
+		 * Level 1 clients may still use the standard URL but a
+		 * custom URL provides additional DPI evasion. */
+		if (!url_match && WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
 			const char *camo_url = WSCONFIG(ws)->camouflage_tunnel_url
 				? WSCONFIG(ws)->camouflage_tunnel_url
 				: CAMOUFLAGE_TUNNEL_URL;
@@ -1993,9 +2016,7 @@ static int connect_handler(worker_st * ws)
 	if (WSCONFIG(ws)->network.name[0] == 0) {
 		oclog(ws, LOG_ERR,
 		      "no networks are configured; rejecting client");
-		cstp_puts(ws, "HTTP/1.1 503 Service Unavailable\r\n");
-		cstp_puts(ws,
-			 "X-Reason: Server configuration error\r\n\r\n");
+		cstp_puts(ws, "HTTP/1.1 503 Service Unavailable\r\n\r\n");
 		return -1;
 	}
 
@@ -2003,9 +2024,7 @@ static int connect_handler(worker_st * ws)
 	if (ret < 0) {
 		oclog(ws, LOG_ERR,
 		      "no networks are configured; rejecting client");
-		cstp_puts(ws, "HTTP/1.1 503 Service Unavailable\r\n");
-		cstp_puts(ws,
-			 "X-Reason: Server configuration error\r\n\r\n");
+		cstp_puts(ws, "HTTP/1.1 503 Service Unavailable\r\n\r\n");
 		return -1;
 	}
 

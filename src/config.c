@@ -925,8 +925,20 @@ static int cfg_ini_handler(void *_ctx, const char *section, const char *name, co
 		}
 	} else if (strcmp(name, "camouflage-tunnel-url") == 0) {
 		READ_STRING(config->camouflage_tunnel_url);
+		if (config->camouflage_tunnel_url &&
+		    config->camouflage_tunnel_url[0] != '/') {
+			fprintf(stderr, WARNSTR"camouflage-tunnel-url must start with '/'\n");
+			talloc_free(config->camouflage_tunnel_url);
+			config->camouflage_tunnel_url = NULL;
+		}
 	} else if (strcmp(name, "camouflage-secret") == 0) {
 		READ_STRING(config->camouflage_secret);
+		if (config->camouflage_secret &&
+		    config->camouflage_secret[0] == '\0') {
+			fprintf(stderr, WARNSTR"camouflage-secret must not be empty\n");
+			talloc_free(config->camouflage_secret);
+			config->camouflage_secret = NULL;
+		}
 #ifdef ENABLE_COMPRESSION
 	} else if (strcmp(name, "compression") == 0) {
 		READ_TF(config->enable_compression);
@@ -1478,6 +1490,12 @@ static void check_cfg(vhost_cfg_st *vhost, vhost_cfg_st *defvhost, unsigned sile
 		} else {
 			config->priorities = talloc_asprintf(config, "%s%s", "NORMAL:%SERVER_PRECEDENCE:%COMPAT", tmp);
 		}
+	}
+
+	if (config->camouflage >= CAMOUFLAGE_FULL && !config->camouflage_secret && !silent) {
+		fprintf(stderr, NOTESTR"%scamouflage level 2 without camouflage-secret: "
+			"CSTP magic bytes will be randomized per-session (clients cannot reconnect)\n",
+			PREFIX_VHOST(vhost));
 	}
 
 	if (vhost->perm_config.occtl_socket_file == NULL)

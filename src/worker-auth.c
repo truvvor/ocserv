@@ -457,10 +457,12 @@ int get_auth_handler2(worker_st * ws, unsigned http_ver, const char *pmsg, unsig
 		goto cleanup;
 	}
 
-	ret = cstp_puts(ws, "X-Transcend-Version: 1\r\n");
-	if (ret < 0) {
-		ret = -1;
-		goto cleanup;
+	if (WSCAMOUFLAGE(ws) < CAMOUFLAGE_FULL) {
+		ret = cstp_puts(ws, "X-Transcend-Version: 1\r\n");
+		if (ret < 0) {
+			ret = -1;
+			goto cleanup;
+		}
 	}
 
 	ret = cstp_puts(ws, "\r\n");
@@ -1087,9 +1089,11 @@ int post_common_handler(worker_st * ws, unsigned http_ver, const char *imsg)
 	if (ret < 0)
 		goto fail;
 
-	ret = cstp_puts(ws, "X-Transcend-Version: 1\r\n");
-	if (ret < 0)
-		goto fail;
+	if (WSCAMOUFLAGE(ws) < CAMOUFLAGE_FULL) {
+		ret = cstp_puts(ws, "X-Transcend-Version: 1\r\n");
+		if (ret < 0)
+			goto fail;
+	}
 
 	{
 		const char *ctx_cookie = (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
