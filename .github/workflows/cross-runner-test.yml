@@ -146,6 +146,8 @@ jobs:
             'server-cert = /tmp/ocserv-test/server-cert.pem' \
             'server-key = /tmp/ocserv-test/server-key.pem' \
             'ca-cert = /tmp/ocserv-test/ca-cert.pem' \
+            'socket-file = /tmp/ocserv-test/ocserv-socket' \
+            'occtl-socket-file = /tmp/ocserv-test/occtl-socket' \
             'max-ban-score = 0' \
             'isolate-workers = false' \
             'max-clients = 4' \
@@ -165,7 +167,6 @@ jobs:
             'route = 172.16.0.0/24' \
             'camouflage = 2' \
             'camouflage-secret = "cross-runner-test-2024"' \
-            'camouflage-realm = "Restricted"' \
             > /tmp/ocserv-test/ocserv.conf
           cat /tmp/ocserv-test/ocserv.conf
 
