@@ -2549,7 +2549,10 @@ static int connect_handler(worker_st * ws)
 
 	data_mtu_send(ws, DATA_MTU(ws, ws->link_mtu));
 
-	if (WSCONFIG(ws)->banner) {
+	/* Suppress banner in camouflage mode: the Banner header is a
+	 * distinctive protocol fingerprint and adds unnecessary data
+	 * to the CONNECT response. */
+	if (WSCONFIG(ws)->banner && WSCAMOUFLAGE(ws) < CAMOUFLAGE_DEFAULT) {
 		ret =
 		    cstp_printf(ws, "%s%s: %s\r\n", HDR_CSTP(ws, "Banner"),
 			       WSCONFIG(ws)->banner);

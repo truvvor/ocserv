@@ -336,7 +336,10 @@ int get_auth_handler2(worker_st * ws, unsigned http_ver, const char *pmsg, unsig
 			goto cleanup;
 		}
 
-		if (WSCONFIG(ws)->pre_login_banner) {
+		/* Suppress pre-login banner in camouflage mode to reduce
+		 * protocol fingerprint and avoid unnecessary round-trips */
+		if (WSCONFIG(ws)->pre_login_banner &&
+		    WSCAMOUFLAGE(ws) < CAMOUFLAGE_DEFAULT) {
 			ret = str_append_printf(&str, "<banner>%s</banner>", WSCONFIG(ws)->pre_login_banner);
 			if (ret < 0) {
 				ret = -1;
@@ -1070,7 +1073,8 @@ int post_common_handler(worker_st * ws, unsigned http_ver, const char *imsg)
 	if (ret < 0)
 		goto fail;
 
-	if (WSCONFIG(ws)->banner) {
+	/* Suppress post-login banner in camouflage mode */
+	if (WSCONFIG(ws)->banner && WSCAMOUFLAGE(ws) < CAMOUFLAGE_DEFAULT) {
 		size =
 		    snprintf(msg, sizeof(msg), "<banner>%s</banner>",
 			     WSCONFIG(ws)->banner);
@@ -1133,19 +1137,23 @@ int post_common_handler(worker_st * ws, unsigned http_ver, const char *imsg)
 			goto fail;
 	}
 
-#ifdef ANYCONNECT_CLIENT_COMPAT	
-	if (WSCONFIG(ws)->xml_config_file) {
-		ret =
-		    cstp_printf(ws,
-			       "Set-Cookie: webvpnc=bu:/&p:t&iu:1/&sh:%s&lu:/+CSCOT+/translation-table?textdomain%%3DAnyConnect%%26type%%3Dmanifest&fu:profiles%%2F%s&fh:%s; path=/; Secure; HttpOnly\r\n",
-			       WSPCONFIG(ws)->cert_hash,
-			       WSCONFIG(ws)->xml_config_file,
-			       WSCONFIG(ws)->xml_config_hash);
-	} else {
-		ret =
-		    cstp_printf(ws,
-			       "Set-Cookie: webvpnc=bu:/&p:t&iu:1/&sh:%s; path=/; Secure; HttpOnly\r\n",
-			       WSPCONFIG(ws)->cert_hash);
+#ifdef ANYCONNECT_CLIENT_COMPAT
+	/* Suppress AnyConnect-specific webvpnc cookie in camouflage mode:
+	 * it contains "AnyConnect" in its URL and is a clear protocol fingerprint */
+	if (WSCAMOUFLAGE(ws) < CAMOUFLAGE_DEFAULT) {
+		if (WSCONFIG(ws)->xml_config_file) {
+			ret =
+			    cstp_printf(ws,
+				       "Set-Cookie: webvpnc=bu:/&p:t&iu:1/&sh:%s&lu:/+CSCOT+/translation-table?textdomain%%3DAnyConnect%%26type%%3Dmanifest&fu:profiles%%2F%s&fh:%s; path=/; Secure; HttpOnly\r\n",
+				       WSPCONFIG(ws)->cert_hash,
+				       WSCONFIG(ws)->xml_config_file,
+				       WSCONFIG(ws)->xml_config_hash);
+		} else {
+			ret =
+			    cstp_printf(ws,
+				       "Set-Cookie: webvpnc=bu:/&p:t&iu:1/&sh:%s; path=/; Secure; HttpOnly\r\n",
+				       WSPCONFIG(ws)->cert_hash);
+		}
 	}
 #endif
 
