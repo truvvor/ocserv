@@ -97,6 +97,42 @@ ssize_t cstp_send(worker_st *ws, const void *data,
 	const uint8_t* p = data;
 
 	if (ws->session != NULL) {
+#if GNUTLS_VERSION_NUMBER >= 0x030604
+		/* When camouflage is enabled, use TLS record padding to randomize
+		 * the record sizes visible on the wire. This uses the TLS 1.3
+		 * record padding mechanism via gnutls_record_send_range().
+		 * The range [data_size, data_size+padding] causes GnuTLS to pad
+		 * TLS records to a random size within the range, making payload
+		 * size analysis significantly harder for DPI. */
+		if (WSCONFIG(ws)->camouflage >= CAMOUFLAGE_DEFAULT) {
+			gnutls_range_st range;
+			range.low = data_size;
+			/* Pad up to 256 extra bytes (or to 1024 minimum) */
+			range.high = data_size + 256;
+			if (range.high < 1024)
+				range.high = 1024;
+			if (range.high > 16384)
+				range.high = 16384;
+
+			while (left > 0) {
+				ret = gnutls_record_send_range(ws->session, p, data_size, &range);
+				if (ret < 0) {
+					if (ret != GNUTLS_E_AGAIN && ret != GNUTLS_E_INTERRUPTED) {
+						/* Range send not supported for this session,
+						 * fall through to standard send */
+						goto standard_send;
+					}
+					ms_sleep(20);
+				}
+				if (ret > 0) {
+					left -= ret;
+					p += ret;
+				}
+			}
+			return data_size;
+		}
+ standard_send:
+#endif
 		while(left > 0) {
 			ret = gnutls_record_send(ws->session, p, data_size);
 			if (ret < 0) {

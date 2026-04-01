@@ -1461,6 +1461,20 @@ static void check_cfg(vhost_cfg_st *vhost, vhost_cfg_st *defvhost, unsigned sile
 
 		if (defvhost) {
 			config->priorities = talloc_asprintf(config, "%s%s", defvhost->perm_config.config->priorities, tmp);
+		} else if (config->camouflage >= CAMOUFLAGE_DEFAULT) {
+			/* Use a priority string that mimics a modern web server (nginx/Apache).
+			 * Key differences from NORMAL:%SERVER_PRECEDENCE:%COMPAT:
+			 * - Prefer TLS 1.3 and CHACHA20-POLY1305 (like modern servers)
+			 * - Include ECDHE key exchange (browsers expect this)
+			 * - Disable old protocols (TLS 1.0/1.1) to look modern
+			 * - Use %SERVER_PRECEDENCE to control cipher order
+			 * This produces a ServerHello that closely matches a
+			 * standard HTTPS server's JA3S fingerprint. */
+			config->priorities = talloc_asprintf(config,
+				"SECURE256:+SECURE128:-VERS-TLS1.0:-VERS-TLS1.1"
+				":-VERS-DTLS1.0:+CHACHA20-POLY1305"
+				":+AES-256-GCM:+AES-128-GCM:+AES-256-CBC:+AES-128-CBC"
+				":%%SERVER_PRECEDENCE:%%SAFE_RENEGOTIATION%s", tmp);
 		} else {
 			config->priorities = talloc_asprintf(config, "%s%s", "NORMAL:%SERVER_PRECEDENCE:%COMPAT", tmp);
 		}

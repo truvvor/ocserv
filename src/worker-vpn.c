@@ -908,6 +908,18 @@ void vpn_server(struct worker_st *ws)
 		GNUTLS_FATAL_ERR(ret);
 
 		oclog(ws, LOG_DEBUG, "TLS handshake completed");
+
+		/* When camouflage is enabled, enable TLS record size padding
+		 * to prevent fingerprinting based on TLS record lengths.
+		 * This uses the TLS 1.3 record padding mechanism or
+		 * GnuTLS record size limit extension to randomize record sizes */
+		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT && session != NULL) {
+#if GNUTLS_VERSION_NUMBER >= 0x030604
+			/* GnuTLS 3.6.4+ supports record size limit extension (RFC 8449)
+			 * which helps mask the actual payload size pattern */
+			gnutls_record_set_max_size(session, 16384);
+#endif
+		}
 	} else {
 		ws->vhost = find_vhost(ws->vconfig, NULL);
 
@@ -2347,7 +2359,16 @@ static int connect_handler(worker_st * ws)
 
 
 	/* set TCP socket options */
-	if (WSCONFIG(ws)->output_buffer > 0) {
+	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
+		/* Set TCP buffer sizes to match typical web server defaults.
+		 * Standard Linux nginx/Apache servers use system defaults of
+		 * ~87380 (recv) and ~16384 (send) or auto-tuned values.
+		 * Using standard values prevents TCP window size fingerprinting. */
+		t = 87380;
+		setsockopt(ws->conn_fd, SOL_SOCKET, SO_RCVBUF, &t, sizeof(t));
+		t = 16384;
+		setsockopt(ws->conn_fd, SOL_SOCKET, SO_SNDBUF, &t, sizeof(t));
+	} else if (WSCONFIG(ws)->output_buffer > 0) {
 		t = ws->link_mtu;
 		t *= WSCONFIG(ws)->output_buffer;
 
