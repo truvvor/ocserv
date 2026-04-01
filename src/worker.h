@@ -301,6 +301,11 @@ typedef struct worker_st {
 
 	/* CSTP framing magic bytes (default: 'S','T','F',1; obfuscated when camouflage >= 2) */
 	uint8_t cstp_magic[4];
+
+	/* Camouflage: packet counter for initial jitter and fake keepalive timing */
+	unsigned camo_pkt_count;       /* counts first N packets for jitter */
+	time_t camo_last_fake_keepalive; /* last time a fake keepalive was sent */
+
 	int tun_fd;
 
 	/* ban points to be sent on exit */

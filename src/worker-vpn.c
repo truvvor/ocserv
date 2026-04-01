@@ -932,15 +932,17 @@ void vpn_server(struct worker_st *ws)
 
 		oclog(ws, LOG_DEBUG, "TLS handshake completed");
 
-		/* When camouflage is enabled, enable TLS record size padding
-		 * to prevent fingerprinting based on TLS record lengths.
-		 * This uses the TLS 1.3 record padding mechanism or
-		 * GnuTLS record size limit extension to randomize record sizes */
+		/* When camouflage is enabled, set a random per-connection TLS
+		 * max record size (4096-8192 bytes) instead of the default
+		 * 16384. This prevents fingerprinting based on fixed record
+		 * sizes and makes each connection's TLS record pattern unique. */
 		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT && session != NULL) {
 #if GNUTLS_VERSION_NUMBER >= 0x030604
-			/* GnuTLS 3.6.4+ supports record size limit extension (RFC 8449)
-			 * which helps mask the actual payload size pattern */
-			gnutls_record_set_max_size(session, 16384);
+			uint32_t rec_rnd;
+			gnutls_rnd(GNUTLS_RND_NONCE, &rec_rnd, sizeof(rec_rnd));
+			/* Random size between 4096 and 8192 */
+			size_t rec_max = 4096 + (rec_rnd % 4097);
+			gnutls_record_set_max_size(session, rec_max);
 #endif
 		}
 	} else {
@@ -1419,6 +1421,31 @@ int periodic_check(worker_st * ws, struct timespec *tnow, unsigned dpd)
 		}
 	}
 
+	/* Fake TLS keepalive: during idle periods, send random-sized
+	 * noise packets over the CSTP channel at randomized intervals.
+	 * This mimics web browsing traffic (HTTP/2 pings, background
+	 * fetches) and prevents DPI from fingerprinting an idle VPN
+	 * tunnel by its lack of traffic or periodic DPD-only pattern. */
+	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
+		uint32_t fk_rnd;
+		gnutls_rnd(GNUTLS_RND_NONCE, &fk_rnd, sizeof(fk_rnd));
+		/* Random interval: 5-25 seconds between fake keepalives */
+		unsigned fk_interval = 5 + (fk_rnd % 21);
+		if (now - ws->camo_last_fake_keepalive >= (time_t)fk_interval) {
+			/* Send a random-sized CSTP keepalive with random payload.
+			 * Size between 64-512 bytes to mimic HTTP/2 frames. */
+			unsigned fk_size = 64 + (fk_rnd >> 8) % 449;
+			memcpy(ws->buffer, ws->cstp_magic, 4);
+			ws->buffer[4] = (fk_size >> 8) & 0xff;
+			ws->buffer[5] = fk_size & 0xff;
+			ws->buffer[6] = AC_PKT_KEEPALIVE;
+			ws->buffer[7] = 0;
+			gnutls_rnd(GNUTLS_RND_NONCE, ws->buffer + 8, fk_size);
+			cstp_send(ws, ws->buffer, 8 + fk_size);
+			ws->camo_last_fake_keepalive = now;
+		}
+	}
+
  cleanup:
 	ws->last_periodic_check = now;
 
@@ -1694,6 +1721,14 @@ static int tun_mainloop(struct worker_st *ws, struct timespec *tnow)
 		return 0;
 	}
 
+	/* Micro-jitter on first 10 data packets: add 1-15ms random delay
+	 * to break the initial burst pattern that DPI uses to fingerprint
+	 * VPN tunnel establishment (analogous to Xray's post-handshake
+	 * fragmentation jitter). */
+	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT && ws->camo_pkt_count < 10) {
+		ws->camo_pkt_count++;
+		ms_sleep(1 + (tnow->tv_nsec % 15));
+	}
 
 	dtls_to_send.data = ws->buffer;
 	dtls_to_send.size = l;
@@ -2036,8 +2071,11 @@ static int connect_handler(worker_st * ws)
 	FUZZ(ws->user_config->interim_update_secs, 5, rnd);
 	FUZZ(WSCONFIG(ws)->rekey_time, 30, rnd);
 
-	/* When camouflage is enabled, randomize DPD and keepalive intervals
-	 * to make timing-based traffic analysis harder */
+	/* When camouflage is enabled, randomize DPD, keepalive, and
+	 * session timing to make traffic analysis harder. The session
+	 * start time jitter (±120s) prevents DPI from correlating
+	 * reconnections by precise session timeout intervals (analogous
+	 * to Xray REALITY SessionID timestamp jitter). */
 	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
 		if (ws->user_config->dpd > 0)
 			FUZZ(ws->user_config->dpd, ws->user_config->dpd / 4, rnd);
@@ -2045,12 +2083,22 @@ static int connect_handler(worker_st * ws)
 			FUZZ(ws->user_config->keepalive, ws->user_config->keepalive / 4, rnd);
 		if (ws->user_config->mobile_dpd > 0)
 			FUZZ(ws->user_config->mobile_dpd, ws->user_config->mobile_dpd / 4, rnd);
+		/* Jitter session start time ±120s to prevent session
+		 * timeout correlation across reconnections */
+		if (ws->user_config->session_timeout_secs > 240)
+			FUZZ(ws->user_config->session_timeout_secs, 120, rnd);
 	}
 
 	/* Connected. Turn of the alarm */
 	if (WSCONFIG(ws)->auth_timeout)
 		alarm(0);
 	http_req_deinit(ws);
+
+	/* Add random delay (5-50ms) before CONNECT response to prevent
+	 * fingerprinting by server response timing pattern */
+	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
+		ms_sleep(5 + (rnd % 46));
+	}
 
 	cstp_cork(ws);
 	/* Phase 2D: use generic "200 OK" instead of distinctive "200 CONNECTED" */
