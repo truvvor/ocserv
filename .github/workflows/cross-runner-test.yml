@@ -202,7 +202,7 @@ jobs:
           CERT_HASH=$(cat /tmp/ocserv-test/cert-hash)
 
           OUTPUT=$(echo "test" | openconnect "127.0.0.1:${VPN_PORT}" \
-            -u test --no-cert-check --cookieonly 2>&1) && {
+            -u test --servercert="${CERT_HASH}" --cookieonly 2>&1) && {
             echo "PASS: Authentication succeeded, got cookie"
           } || {
             echo "openconnect output: ${OUTPUT}"
@@ -218,10 +218,11 @@ jobs:
       - name: "TEST 3: VPN tunnel + routing"
         run: |
           echo "=== TEST 3: VPN Tunnel Establishment ==="
+          CERT_HASH=$(cat /tmp/ocserv-test/cert-hash)
 
           # Start openconnect in background
           echo "test" | echo "${SUDO_PASS}" | sudo -S openconnect "127.0.0.1:${VPN_PORT}" \
-            -u test --no-cert-check --no-dtls \
+            -u test --servercert="${CERT_HASH}" --no-dtls \
             -b --pid-file=/tmp/oc-pid.tmp \
             2>/tmp/oc-connect.log
 
@@ -260,8 +261,9 @@ jobs:
 
           # Generate traffic — new TLS connection
           timeout 5 openssl s_client -connect "127.0.0.1:${VPN_PORT}" < /dev/null 2>/dev/null || true
+          CERT_HASH=$(cat /tmp/ocserv-test/cert-hash)
           echo "test" | openconnect "127.0.0.1:${VPN_PORT}" \
-            -u test --no-cert-check --cookieonly 2>/dev/null || true
+            -u test --servercert="${CERT_HASH}" --cookieonly 2>/dev/null || true
           sleep 2
 
           kill $TCPDUMP_PID 2>/dev/null || true
@@ -298,8 +300,9 @@ jobs:
           echo "=== TEST 5: HTTP Header Fingerprint Check ==="
 
           # Connect and capture the full HTTP exchange
+          CERT_HASH=$(cat /tmp/ocserv-test/cert-hash)
           RESPONSE=$(echo "test" | openconnect "127.0.0.1:${VPN_PORT}" \
-            -u test --no-cert-check --cookieonly -v 2>&1 || true)
+            -u test --servercert="${CERT_HASH}" --cookieonly -v 2>&1 || true)
 
           echo "--- Checking for leaked headers ---"
 
@@ -446,6 +449,11 @@ jobs:
 
           echo "test:*:$(echo -n 'test' | openssl passwd -5 -stdin)" > /tmp/ocserv-test2/passwd
 
+          # Get cert hash
+          CERT_HASH2=$(openssl x509 -in /tmp/ocserv-test2/server-cert.pem -fingerprint -sha1 -noout 2>/dev/null | sed 's/.*=//;s/://g' | tr 'A-F' 'a-f')
+          echo "${CERT_HASH2}" > /tmp/ocserv-test2/cert-hash
+          echo "Cert hash: ${CERT_HASH2}"
+
           # Enable forwarding
           echo "${SUDO_PASS}" | sudo -S sysctl -w net.ipv4.ip_forward=1
 
@@ -464,13 +472,13 @@ jobs:
           echo ""
           echo "--- TEST A: Authentication ---"
           echo "test" | openconnect "127.0.0.1:9444" \
-            -u test --no-cert-check --cookieonly 2>&1 && echo "PASS" || echo "INFO: non-zero exit (may be OK)"
+            -u test --servercert="${CERT_HASH2}" --cookieonly 2>&1 && echo "PASS" || echo "INFO: non-zero exit (may be OK)"
 
           # TEST: Establish tunnel
           echo ""
           echo "--- TEST B: VPN Tunnel ---"
           echo "test" | echo "${SUDO_PASS}" | sudo -S openconnect "127.0.0.1:9444" \
-            -u test --no-cert-check --no-dtls \
+            -u test --servercert="${CERT_HASH2}" --no-dtls \
             -b --pid-file=/tmp/oc-pid2.tmp 2>/tmp/oc-connect2.log
           sleep 5
 
