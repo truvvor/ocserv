@@ -27,10 +27,11 @@ jobs:
             libkrb5-dev libradcli-dev libcurl4-gnutls-dev \
             libcjose-dev libjansson-dev libprotobuf-c-dev \
             protobuf-c-compiler libtalloc-dev libhttp-parser-dev \
-            libpcl1-dev libopts25-dev autogen gperf \
+            libopts25-dev autogen gperf \
             nuttcp openconnect iproute2 iputils-ping \
             tcpdump tshark gnutls-bin procps
-          # Optional: nDPI for protocol detection
+          # Optional packages (may not exist on all distros)
+          echo "${SUDO_PASS}" | sudo -S apt-get install -y libpcl1-dev 2>/dev/null || true
           echo "${SUDO_PASS}" | sudo -S apt-get install -y ndpi-tools 2>/dev/null || true
 
       - name: Configure
@@ -69,10 +70,13 @@ jobs:
           echo "${SUDO_PASS}" | sudo -S apt-get update
           echo "${SUDO_PASS}" | sudo -S apt-get install -y \
             openconnect iproute2 iputils-ping nuttcp \
-            tcpdump tshark gnutls-bin procps libev4 \
-            libgnutls30 libtalloc2 libhttp-parser2.9 \
-            libprotobuf-c1 libradcli4 libcjose0 \
-            libjansson4 liblz4-1 libseccomp2 libpam0g
+            tcpdump tshark gnutls-bin procps
+          # Install runtime libs - names vary by Ubuntu version
+          echo "${SUDO_PASS}" | sudo -S apt-get install -y \
+            libev4 libgnutls30 libtalloc2 libprotobuf-c1 \
+            libjansson4 liblz4-1 libseccomp2 libpam0g 2>/dev/null || true
+          echo "${SUDO_PASS}" | sudo -S apt-get install -y \
+            libhttp-parser2.9 libradcli4 libcjose0 2>/dev/null || true
           echo "${SUDO_PASS}" | sudo -S apt-get install -y ndpi-tools 2>/dev/null || true
 
       - name: Download build artifacts
@@ -111,10 +115,12 @@ jobs:
           echo "${SUDO_PASS}" | sudo -S apt-get update
           echo "${SUDO_PASS}" | sudo -S apt-get install -y \
             openconnect iproute2 iputils-ping nuttcp \
-            tcpdump tshark gnutls-bin procps libev4 \
-            libgnutls30 libtalloc2 libhttp-parser2.9 \
-            libprotobuf-c1 libradcli4 libcjose0 \
-            libjansson4 liblz4-1 libseccomp2 libpam0g
+            tcpdump tshark gnutls-bin procps
+          echo "${SUDO_PASS}" | sudo -S apt-get install -y \
+            libev4 libgnutls30 libtalloc2 libprotobuf-c1 \
+            libjansson4 liblz4-1 libseccomp2 libpam0g 2>/dev/null || true
+          echo "${SUDO_PASS}" | sudo -S apt-get install -y \
+            libhttp-parser2.9 libradcli4 libcjose0 2>/dev/null || true
           echo "${SUDO_PASS}" | sudo -S apt-get install -y ndpi-tools 2>/dev/null || true
 
       - name: Download build artifacts
@@ -153,10 +159,12 @@ jobs:
           echo "${SUDO_PASS}" | sudo -S apt-get update
           echo "${SUDO_PASS}" | sudo -S apt-get install -y \
             openconnect iproute2 iputils-ping nuttcp \
-            tcpdump tshark gnutls-bin procps libev4 \
-            libgnutls30 libtalloc2 libhttp-parser2.9 \
-            libprotobuf-c1 libradcli4 libcjose0 \
-            libjansson4 liblz4-1 libseccomp2 libpam0g
+            tcpdump tshark gnutls-bin procps
+          echo "${SUDO_PASS}" | sudo -S apt-get install -y \
+            libev4 libgnutls30 libtalloc2 libprotobuf-c1 \
+            libjansson4 liblz4-1 libseccomp2 libpam0g 2>/dev/null || true
+          echo "${SUDO_PASS}" | sudo -S apt-get install -y \
+            libhttp-parser2.9 libradcli4 libcjose0 2>/dev/null || true
           echo "${SUDO_PASS}" | sudo -S apt-get install -y ndpi-tools 2>/dev/null || true
 
       - name: Download build artifacts
@@ -202,7 +210,8 @@ jobs:
             libkrb5-dev libradcli-dev libcurl4-gnutls-dev \
             libcjose-dev libjansson-dev libprotobuf-c-dev \
             protobuf-c-compiler libtalloc-dev libhttp-parser-dev \
-            libpcl1-dev libopts25-dev autogen gperf
+            libopts25-dev autogen gperf
+          echo "${SUDO_PASS}" | sudo -S apt-get install -y libpcl1-dev 2>/dev/null || true
 
       - name: Build from source
         run: |
