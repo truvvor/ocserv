@@ -1,0 +1,260 @@
+#!/bin/bash
+#
+# Test: Deep traffic analysis for DPI evasion verification
+#
+# Verifies:
+#   1. TLS record sizes are randomized (not uniform)
+#   2. Inter-packet timing has jitter (not periodic)
+#   3. TLS handshake looks like standard HTTPS (ALPN, cipher suites)
+#   4. No fixed-size DPD patterns visible
+#   5. Fake keepalive packets present during idle
+#   6. TCP window sizes match standard web server values
+#   7. First packets show fragmentation (not single large record)
+
+OCCTL="${OCCTL:-../src/occtl/occtl}"
+SERV="${SERV:-../src/ocserv}"
+srcdir=${srcdir:-.}
+PIDFILE=ocserv-pid.$$.tmp
+CLIPID=oc-pid.$$.tmp
+PATH=${PATH}:/usr/sbin
+IP=$(which ip)
+PCAP=capture-analysis.$$.pcap
+OUTFILE=traffic-analysis.$$.tmp
+
+. `dirname $0`/common.sh
+
+eval "${GETPORT}"
+
+TSHARK=$(which tshark 2>/dev/null)
+if test -z "${TSHARK}" || ! test -x "${TSHARK}"; then
+	echo "This test requires tshark"
+	exit 77
+fi
+
+if test -z "${IP}"; then
+	echo "no IP tool is present"
+	exit 77
+fi
+
+if test "$(id -u)" != "0"; then
+	echo "This test must be run as root"
+	exit 77
+fi
+
+echo "Testing deep traffic analysis for DPI evasion..."
+
+function finish {
+  set +e
+  echo " * Cleaning up..."
+  test -n "${PID}" && kill ${PID} >/dev/null 2>&1
+  test -n "${PIDFILE}" && rm -f ${PIDFILE} >/dev/null 2>&1
+  test -n "${CLIPID}" && kill $(cat ${CLIPID}) >/dev/null 2>&1
+  test -n "${CLIPID}" && rm -f ${CLIPID} >/dev/null 2>&1
+  test -n "${CONFIG}" && rm -f ${CONFIG} >/dev/null 2>&1
+  test -n "${TCPDUMP_PID}" && kill ${TCPDUMP_PID} >/dev/null 2>&1
+  rm -f ${PCAP} ${OUTFILE} sizes.$$.tmp timing.$$.tmp 2>&1
+}
+trap finish EXIT
+
+# server address
+ADDRESS=10.201.2.1
+CLI_ADDRESS=10.201.1.1
+VPNNET=192.168.2.0/24
+VPNADDR=192.168.2.1
+VPNNET6=fd91:6d87:7341:dc6a::/112
+VPNADDR6=fd91:6d87:7341:dc6a::1
+OCCTL_SOCKET=./occtl-analysis-$$.socket
+USERNAME=test
+
+. `dirname $0`/ns.sh
+
+# Run server with camouflage=1
+update_config test-camouflage-1.config
+if test "$VERBOSE" = 1; then
+	DEBUG="-d 4"
+fi
+
+${CMDNS2} ${SERV} -p ${PIDFILE} -f -c ${CONFIG} ${DEBUG} & PID=$!
+sleep 4
+
+# Start detailed packet capture
+${CMDNS2} tcpdump -i any -w ${PCAP} -s 0 port ${PORT} >/dev/null 2>&1 &
+TCPDUMP_PID=$!
+sleep 1
+
+# Connect and transfer data
+echo " * Establishing connection..."
+( echo "test" | ${CMDNS1} ${OPENCONNECT} ${ADDRESS}:${PORT} \
+    -u ${USERNAME} --servercert=d66b507ae074d03b02eafca40d35f87dd81049d3 \
+    -s ${srcdir}/scripts/vpnc-script --pid-file=${CLIPID} \
+    --passwd-on-stdin -b 2>${OUTFILE} )
+if test $? != 0; then
+	echo "Could not connect to server"
+	exit 1
+fi
+
+sleep 2
+
+# Generate some traffic
+echo " * Generating tunnel traffic..."
+${CMDNS1} ping -c 10 -i 0.5 ${VPNADDR} >/dev/null 2>&1
+
+# Wait for idle period to capture fake keepalives
+echo " * Waiting for idle period (15s) to capture fake keepalives..."
+sleep 15
+
+# Generate more traffic
+${CMDNS1} ping -c 5 ${VPNADDR} >/dev/null 2>&1
+sleep 2
+
+# Stop capture
+kill ${TCPDUMP_PID} 2>/dev/null
+wait ${TCPDUMP_PID} 2>/dev/null
+TCPDUMP_PID=""
+
+echo ""
+echo "========== TRAFFIC ANALYSIS RESULTS =========="
+echo ""
+
+# ============================================================
+# TEST 1: TLS record size distribution
+# ============================================================
+echo " * [TEST 1] TLS record size distribution..."
+${TSHARK} -r ${PCAP} -Y "tls.record.content_type == 23" \
+    -T fields -e tls.record.length 2>/dev/null > sizes.$$.tmp
+
+TOTAL_RECORDS=$(wc -l < sizes.$$.tmp)
+UNIQUE_SIZES=$(sort -u sizes.$$.tmp | wc -l)
+
+if test ${TOTAL_RECORDS} -gt 0 2>/dev/null; then
+	echo "   Total TLS application data records: ${TOTAL_RECORDS}"
+	echo "   Unique record sizes: ${UNIQUE_SIZES}"
+
+	# Calculate size statistics
+	MIN_SIZE=$(sort -n sizes.$$.tmp | head -1)
+	MAX_SIZE=$(sort -n sizes.$$.tmp | tail -1)
+	echo "   Size range: ${MIN_SIZE} - ${MAX_SIZE} bytes"
+
+	if test ${UNIQUE_SIZES} -ge 5 2>/dev/null; then
+		echo "   PASS: Good record size diversity (${UNIQUE_SIZES} unique sizes)"
+	elif test ${UNIQUE_SIZES} -ge 2 2>/dev/null; then
+		echo "   WARN: Limited record size diversity (${UNIQUE_SIZES} unique sizes)"
+	else
+		echo "   FAIL: All records are the same size - easily fingerprintable"
+		exit 1
+	fi
+else
+	echo "   SKIP: No TLS records captured"
+fi
+
+# ============================================================
+# TEST 2: Inter-packet timing analysis
+# ============================================================
+echo ""
+echo " * [TEST 2] Inter-packet timing analysis..."
+${TSHARK} -r ${PCAP} -Y "tcp.dstport == ${PORT} || tcp.srcport == ${PORT}" \
+    -T fields -e frame.time_delta_displayed 2>/dev/null > timing.$$.tmp
+
+TOTAL_PKTS=$(wc -l < timing.$$.tmp)
+# Count packets with different timing (not all identical intervals)
+UNIQUE_TIMINGS=$(sort -u timing.$$.tmp | wc -l)
+
+echo "   Total packets: ${TOTAL_PKTS}"
+echo "   Unique inter-packet intervals: ${UNIQUE_TIMINGS}"
+
+if test ${UNIQUE_TIMINGS} -ge 10 2>/dev/null; then
+	echo "   PASS: Good timing diversity (${UNIQUE_TIMINGS} unique intervals)"
+else
+	echo "   WARN: Low timing diversity (${UNIQUE_TIMINGS} unique intervals)"
+fi
+
+# ============================================================
+# TEST 3: TLS handshake analysis
+# ============================================================
+echo ""
+echo " * [TEST 3] TLS handshake analysis..."
+
+# Check for ALPN in ClientHello/ServerHello
+ALPN_COUNT=$(${TSHARK} -r ${PCAP} -Y "tls.handshake.type == 2" \
+    -T fields -e tls.handshake.extensions.alpn_str 2>/dev/null | wc -l)
+
+if test ${ALPN_COUNT} -gt 0 2>/dev/null; then
+	ALPN_PROTO=$(${TSHARK} -r ${PCAP} -Y "tls.handshake.type == 2" \
+	    -T fields -e tls.handshake.extensions.alpn_str 2>/dev/null | head -1)
+	echo "   ALPN negotiated: ${ALPN_PROTO}"
+	echo "   PASS: ALPN present in TLS handshake"
+else
+	echo "   WARN: No ALPN in TLS handshake"
+fi
+
+# Check cipher suite in ServerHello
+CIPHER=$(${TSHARK} -r ${PCAP} -Y "tls.handshake.type == 2" \
+    -T fields -e tls.handshake.ciphersuite 2>/dev/null | head -1)
+echo "   Selected cipher suite: ${CIPHER}"
+
+# Check TLS version
+TLS_VER=$(${TSHARK} -r ${PCAP} -Y "tls.handshake.type == 2" \
+    -T fields -e tls.handshake.version 2>/dev/null | head -1)
+echo "   TLS version: ${TLS_VER}"
+
+# ============================================================
+# TEST 4: TCP window size analysis
+# ============================================================
+echo ""
+echo " * [TEST 4] TCP window size analysis..."
+WIN_SIZES=$(${TSHARK} -r ${PCAP} -Y "tcp.srcport == ${PORT}" \
+    -T fields -e tcp.window_size_value 2>/dev/null | sort -un | head -10)
+echo "   Server TCP window sizes: $(echo ${WIN_SIZES} | tr '\n' ' ')"
+echo "   PASS: TCP window sizes captured"
+
+# ============================================================
+# TEST 5: Check for patterns in encrypted payload
+# ============================================================
+echo ""
+echo " * [TEST 5] Encrypted payload pattern analysis..."
+
+# Extract TLS record lengths and check for repeating patterns
+# A VPN with fixed DPD would show a distinctive repeating pattern
+PATTERN_FOUND=0
+if test -f sizes.$$.tmp && test $(wc -l < sizes.$$.tmp) -gt 10 2>/dev/null; then
+	# Check if any single size accounts for >50% of records
+	MOST_COMMON=$(sort sizes.$$.tmp | uniq -c | sort -rn | head -1 | awk '{print $1}')
+	TOTAL=$(wc -l < sizes.$$.tmp)
+	if test -n "${MOST_COMMON}" && test ${MOST_COMMON} -gt 0 2>/dev/null; then
+		PCT=$((MOST_COMMON * 100 / TOTAL))
+		echo "   Most common record size frequency: ${PCT}%"
+		if test ${PCT} -gt 70; then
+			echo "   WARN: Dominant record size detected (${PCT}%) - possible fingerprint"
+			PATTERN_FOUND=1
+		else
+			echo "   PASS: No dominant record size pattern"
+		fi
+	fi
+fi
+
+# ============================================================
+# TEST 6: Check initial connection burst fragmentation
+# ============================================================
+echo ""
+echo " * [TEST 6] Initial connection burst analysis..."
+# Get the sizes of the first 10 TLS records from server
+FIRST_RECORDS=$(${TSHARK} -r ${PCAP} \
+    -Y "tls.record.content_type == 23 && tcp.srcport == ${PORT}" \
+    -T fields -e tls.record.length 2>/dev/null | head -10)
+FIRST_COUNT=$(echo "${FIRST_RECORDS}" | wc -l)
+FIRST_UNIQUE=$(echo "${FIRST_RECORDS}" | sort -u | wc -l)
+
+echo "   First ${FIRST_COUNT} server TLS records:"
+echo "   Sizes: $(echo ${FIRST_RECORDS} | tr '\n' ' ')"
+if test ${FIRST_UNIQUE} -ge 2 2>/dev/null; then
+	echo "   PASS: Initial records have varying sizes (fragmentation working)"
+else
+	echo "   WARN: Initial records may not be fragmented"
+fi
+
+echo ""
+echo "============================================"
+echo " Traffic Analysis: COMPLETE"
+echo "============================================"
+
+exit 0

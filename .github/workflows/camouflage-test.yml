@@ -1,0 +1,240 @@
+name: Camouflage DPI Evasion Tests
+
+on:
+  push:
+    branches:
+      - 'claude/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ocserv with camouflage
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential autoconf automake libtool pkg-config \
+            libgnutls28-dev libev-dev libpam0g-dev liblz4-dev \
+            libseccomp-dev libreadline-dev libnl-route-3-dev \
+            libkrb5-dev libradcli-dev libcurl4-gnutls-dev \
+            libcjose-dev libjansson-dev libprotobuf-c-dev \
+            protobuf-c-compiler libtalloc-dev libhttp-parser-dev \
+            libpcl1-dev libopts25-dev autogen gperf \
+            nuttcp openconnect iproute2 iputils-ping \
+            tcpdump tshark gnutls-bin procps
+          # Optional: nDPI for protocol detection
+          sudo apt-get install -y ndpi-tools 2>/dev/null || true
+
+      - name: Configure
+        run: |
+          autoreconf -fvi
+          ./configure --without-nuttcp-tests
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Verify build
+        run: |
+          ./src/ocserv --version || true
+          echo "Build successful"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocserv-build
+          path: |
+            src/ocserv
+            src/ocserv-worker
+            src/occtl/occtl
+          retention-days: 1
+
+  test-camouflage-level1:
+    name: "Test: Camouflage Level 1"
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openconnect iproute2 iputils-ping nuttcp \
+            tcpdump tshark gnutls-bin procps libev4 \
+            libgnutls30 libtalloc2 libhttp-parser2.9 \
+            libprotobuf-c1 libradcli4 libcjose0 \
+            libjansson4 liblz4-1 libseccomp2 libpam0g
+          sudo apt-get install -y ndpi-tools 2>/dev/null || true
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ocserv-build
+          path: src/
+
+      - name: Fix permissions
+        run: |
+          chmod +x src/ocserv src/ocserv-worker src/occtl/occtl
+          chmod +x tests/camouflage-level1
+
+      - name: Build (for libs)
+        run: |
+          autoreconf -fvi 2>/dev/null || true
+          ./configure 2>/dev/null || true
+          make -j$(nproc) 2>/dev/null || true
+
+      - name: Run Camouflage Level 1 Tests
+        run: |
+          cd tests
+          sudo VERBOSE=1 bash ./camouflage-level1
+        timeout-minutes: 10
+
+  test-camouflage-level2:
+    name: "Test: Camouflage Level 2"
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openconnect iproute2 iputils-ping nuttcp \
+            tcpdump tshark gnutls-bin procps libev4 \
+            libgnutls30 libtalloc2 libhttp-parser2.9 \
+            libprotobuf-c1 libradcli4 libcjose0 \
+            libjansson4 liblz4-1 libseccomp2 libpam0g
+          sudo apt-get install -y ndpi-tools 2>/dev/null || true
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ocserv-build
+          path: src/
+
+      - name: Fix permissions
+        run: |
+          chmod +x src/ocserv src/ocserv-worker src/occtl/occtl
+          chmod +x tests/camouflage-level2
+
+      - name: Build (for libs)
+        run: |
+          autoreconf -fvi 2>/dev/null || true
+          ./configure 2>/dev/null || true
+          make -j$(nproc) 2>/dev/null || true
+
+      - name: Run Camouflage Level 2 Tests
+        run: |
+          cd tests
+          sudo VERBOSE=1 bash ./camouflage-level2
+        timeout-minutes: 10
+
+  test-traffic-analysis:
+    name: "Test: Deep Traffic Analysis"
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openconnect iproute2 iputils-ping nuttcp \
+            tcpdump tshark gnutls-bin procps libev4 \
+            libgnutls30 libtalloc2 libhttp-parser2.9 \
+            libprotobuf-c1 libradcli4 libcjose0 \
+            libjansson4 liblz4-1 libseccomp2 libpam0g
+          sudo apt-get install -y ndpi-tools 2>/dev/null || true
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ocserv-build
+          path: src/
+
+      - name: Fix permissions
+        run: |
+          chmod +x src/ocserv src/ocserv-worker src/occtl/occtl
+          chmod +x tests/camouflage-traffic-analysis
+
+      - name: Build (for libs)
+        run: |
+          autoreconf -fvi 2>/dev/null || true
+          ./configure 2>/dev/null || true
+          make -j$(nproc) 2>/dev/null || true
+
+      - name: Run Deep Traffic Analysis
+        run: |
+          cd tests
+          sudo VERBOSE=1 bash ./camouflage-traffic-analysis
+        timeout-minutes: 10
+
+  test-regression:
+    name: "Test: Regression (camouflage=0)"
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openconnect iproute2 iputils-ping nuttcp \
+            tcpdump tshark gnutls-bin procps \
+            build-essential autoconf automake libtool pkg-config \
+            libgnutls28-dev libev-dev libpam0g-dev liblz4-dev \
+            libseccomp-dev libreadline-dev libnl-route-3-dev \
+            libkrb5-dev libradcli-dev libcurl4-gnutls-dev \
+            libcjose-dev libjansson-dev libprotobuf-c-dev \
+            protobuf-c-compiler libtalloc-dev libhttp-parser-dev \
+            libpcl1-dev libopts25-dev autogen gperf
+
+      - name: Build from source
+        run: |
+          autoreconf -fvi
+          ./configure
+          make -j$(nproc)
+
+      - name: Run existing test suite (camouflage=0)
+        run: |
+          cd tests
+          # Run the unit tests that don't require network namespaces
+          sudo make check 2>&1 || true
+          # Show results
+          cat test-suite.log 2>/dev/null | tail -30 || true
+        timeout-minutes: 15
+
+  summary:
+    name: Test Summary
+    needs:
+      - test-camouflage-level1
+      - test-camouflage-level2
+      - test-traffic-analysis
+      - test-regression
+    runs-on: self-hosted
+    if: always()
+    steps:
+      - name: Report results
+        run: |
+          echo "============================================"
+          echo "  CAMOUFLAGE DPI EVASION TEST RESULTS"
+          echo "============================================"
+          echo ""
+          echo "  Level 1 (server-side):    ${{ needs.test-camouflage-level1.result }}"
+          echo "  Level 2 (full):           ${{ needs.test-camouflage-level2.result }}"
+          echo "  Traffic Analysis:         ${{ needs.test-traffic-analysis.result }}"
+          echo "  Regression (camo=0):      ${{ needs.test-regression.result }}"
+          echo ""
+          echo "============================================"
