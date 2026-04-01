@@ -105,15 +105,19 @@ ssize_t cstp_send(worker_st *ws, const void *data,
 		 * TLS records to a random size within the range, making payload
 		 * size analysis significantly harder for DPI. */
 		if (WSCONFIG(ws)->camouflage >= CAMOUFLAGE_DEFAULT) {
+			int retries = 0;
 			while (left > 0) {
 				gnutls_range_st range;
+				size_t high;
 				range.low = left;
-				/* Pad up to 256 extra bytes (or to 1024 minimum) */
-				range.high = left + 256;
-				if (range.high < 1024)
-					range.high = 1024;
-				if (range.high > 16384)
-					range.high = 16384;
+				/* Pad up to 256 extra bytes (or to 1024 minimum).
+				 * Cap at 16384 (TLS max record size). */
+				high = (size_t)left + 256;
+				if (high < 1024)
+					high = 1024;
+				if (high > 16384)
+					high = 16384;
+				range.high = high;
 
 				ret = gnutls_record_send_range(ws->session, p, left, &range);
 				if (ret < 0) {
@@ -122,9 +126,15 @@ ssize_t cstp_send(worker_st *ws, const void *data,
 						 * fall through to standard send */
 						goto standard_send;
 					}
+					if (++retries > 50)
+						return GNUTLS_E_TIMEDOUT;
 					ms_sleep(20);
-				}
-				if (ret > 0) {
+				} else if (ret == 0) {
+					if (++retries > 50)
+						return GNUTLS_E_TIMEDOUT;
+					ms_sleep(20);
+				} else {
+					retries = 0;
 					left -= ret;
 					p += ret;
 				}
@@ -133,20 +143,26 @@ ssize_t cstp_send(worker_st *ws, const void *data,
 		}
  standard_send:
 #endif
-		while(left > 0) {
-			ret = gnutls_record_send(ws->session, p, left);
-			if (ret < 0) {
-				if (ret != GNUTLS_E_AGAIN && ret != GNUTLS_E_INTERRUPTED) {
-					return ret;
-				} else {
-					/* do not cause mayhem */
+		{
+			int retries = 0;
+			while(left > 0) {
+				ret = gnutls_record_send(ws->session, p, left);
+				if (ret < 0) {
+					if (ret != GNUTLS_E_AGAIN && ret != GNUTLS_E_INTERRUPTED) {
+						return ret;
+					}
+					if (++retries > 50)
+						return GNUTLS_E_TIMEDOUT;
 					ms_sleep(20);
+				} else if (ret == 0) {
+					if (++retries > 50)
+						return GNUTLS_E_TIMEDOUT;
+					ms_sleep(20);
+				} else {
+					retries = 0;
+					left -= ret;
+					p += ret;
 				}
-			}
-
-			if (ret > 0) {
-				left -= ret;
-				p += ret;
 			}
 		}
 		return data_size;
