@@ -1,6 +1,9 @@
 name: Cross-Runner VPN Network Test
 
 on:
+  push:
+    branches:
+      - 'claude/**'
   workflow_dispatch:
     inputs:
       server_port:
