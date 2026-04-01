@@ -207,6 +207,15 @@ int disable_system_calls(struct worker_st *ws)
 	ADD_SYSCALL(rt_sigaction, 0);
 	ADD_SYSCALL(eventfd2, 0);
 
+	/* futex is used by glibc/pthread internally (e.g., mutex operations
+	 * triggered by gnutls ALPN, HMAC, and record padding functions).
+	 * Without this, seccomp blocks the call and glibc aborts with
+	 * "The futex facility returned an unexpected error code." */
+	ADD_SYSCALL(futex, 0);
+#ifdef __NR_futex_waitv
+	ADD_SYSCALL(futex_waitv, 0);
+#endif
+
 	ret = seccomp_load(ctx);
 	if (ret < 0) {
 		oclog(ws, LOG_DEBUG, "could not load seccomp filter");
