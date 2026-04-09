@@ -890,14 +890,18 @@ void vpn_server(struct worker_st *ws)
 		GNUTLS_FATAL_ERR(ret);
 		gnutls_session_set_ptr(session, ws);
 
-		/* When camouflage is enabled, advertise ALPN protocols to
-		 * mimic a standard HTTPS server (browsers negotiate h2/http1.1) */
+		/* When camouflage is enabled, advertise ALPN so a TLS prober
+		 * sees a plausible HTTPS server. We intentionally advertise
+		 * only http/1.1: ocserv does not speak HTTP/2, and offering
+		 * "h2" would let a client select it and then fail on the
+		 * first HTTP/2 frame — an obvious fingerprint. Nginx
+		 * deployments without an `http2` directive behave identically
+		 * (http/1.1 only). */
 		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_DEFAULT) {
-			gnutls_datum_t alpn_protos[2] = {
-				{(unsigned char *)"h2", 2},
+			gnutls_datum_t alpn_protos[1] = {
 				{(unsigned char *)"http/1.1", 8}
 			};
-			ret = gnutls_alpn_set_protocols(session, alpn_protos, 2, 0);
+			ret = gnutls_alpn_set_protocols(session, alpn_protos, 1, 0);
 			if (ret < 0) {
 				oclog(ws, LOG_DEBUG,
 				      "could not set ALPN protocols: %s",
