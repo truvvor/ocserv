@@ -194,7 +194,23 @@ int disable_system_calls(struct worker_st *ws)
 			break;
 		}
 	}
-#endif	
+#endif
+
+	/* REQ-1.1: the camouflage decoy directory (if configured) requires
+	 * stat/open syscalls to serve static files from disk. */
+	{
+		vhost_cfg_st *vcamo = NULL;
+		list_for_each(ws->vconfig, vcamo, list) {
+			if (vcamo->perm_config.config->camouflage_decoy_dir) {
+				ADD_SYSCALL(stat, 0);
+				ADD_SYSCALL(stat64, 0);
+				ADD_SYSCALL(newfstatat, 0);
+				ADD_SYSCALL(open, 0);
+				ADD_SYSCALL(openat, 0);
+				break;
+			}
+		}
+	}
 
 	/* this we need to get the MTU from
 	 * the TUN device */

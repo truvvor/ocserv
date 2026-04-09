@@ -74,6 +74,7 @@ ocserv_worker_CPPFLAGS = $(AM_CPPFLAGS) -DOCSERV_WORKER_PROCESS
 ocserv_worker_SOURCES = $(CORE_SOURCES) \
 	html.c html.h http-heads.h worker.c worker.h worker-auth.c \
 	worker-bandwidth.c worker-bandwidth.h worker-http.c worker-http-handlers.c \
+	worker-camouflage.c \
 	worker-kkdcp.c worker-misc.c worker-privs.c worker-proxyproto.c \
 	worker-resume.c worker-vpn.c
 

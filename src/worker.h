@@ -306,6 +306,11 @@ typedef struct worker_st {
 	unsigned camo_pkt_count;       /* counts first N packets for jitter */
 	time_t camo_last_fake_keepalive; /* last time a fake keepalive was sent */
 
+	/* REQ-1: active probing protection. Set when the current connection
+	 * has been flagged as a probe (replay, missing marker, etc). Once
+	 * set, the worker only serves the decoy page. */
+	unsigned camo_probe_detected;
+
 	int tun_fd;
 
 	/* ban points to be sent on exit */
@@ -349,6 +354,11 @@ int get_ca_der_handler(worker_st * ws, unsigned http_ver);
 
 int response_404(worker_st *ws, unsigned http_ver);
 int get_empty_handler(worker_st *server, unsigned http_ver);
+
+/* REQ-1: active probing protection (worker-camouflage.c) */
+int camouflage_send_decoy(worker_st *ws, unsigned http_ver, int is_404);
+int camouflage_check_auth_marker(worker_st *ws);
+int camouflage_is_replay(worker_st *ws);
 #ifdef ANYCONNECT_CLIENT_COMPAT
 int get_config_handler(worker_st *ws, unsigned http_ver);
 #endif

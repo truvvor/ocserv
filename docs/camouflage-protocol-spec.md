@@ -30,6 +30,18 @@ camouflage-secret = "my-shared-secret"
 
 # Custom tunnel URL (default: /api/v1/session)
 camouflage-tunnel-url = /api/v1/session
+
+# REQ-1: active probing protection (level 2 only)
+# Secret URL-path prefix that must appear on all VPN requests.
+# Without this prefix the server serves an nginx-mimicking decoy page.
+camouflage-auth-path = /s3cr3t/portal
+
+# Optional directory of static files to serve as the decoy. When not set
+# the server responds with a built-in nginx welcome page.
+camouflage-decoy-dir = /var/www/html
+
+# Enable TLS handshake replay detection (default: on at level 2)
+camouflage-replay-detect = true
 ```
 
 ---
@@ -440,6 +452,128 @@ X-Reason: Server error\r\n\r\n
 
 Added `futex` syscall to the seccomp whitelist. Required because ALPN, HMAC, and record padding functions in GnuTLS use pthread internally.
 
+When `camouflage-decoy-dir` is configured, the seccomp filter also allows `stat`, `stat64`, `newfstatat`, `open`, and `openat` so the worker can serve static files from disk.
+
+---
+
+## 13. REQ-1 Active Probing Protection (Level 2 only)
+
+TSPU-class DPI systems (Russian state censorship, the original motivation) defeat naive camouflage by actively probing :443 endpoints: they send a plain `GET /`, watch the response, and compare its shape against known VPN fingerprints. REQ-1 implements three defenses that together make the ocserv listener indistinguishable from a stock nginx install unless the probing client knows a shared secret.
+
+### 13.1 REQ-1.1 Decoy Website
+
+When a request reaches the worker at camouflage level ≥ 2 and does not carry the secret marker (REQ-1.2), the worker responds with an nginx-shaped HTTP response.
+
+Response headers (in order, emitted by `camouflage_send_decoy()` in `src/worker-camouflage.c`):
+
+```http
+HTTP/1.1 200 OK
+Server: nginx/1.24.0
+Date: <RFC7231 IMF-fixdate>
+Content-Type: text/html
+Content-Length: <N>
+Connection: keep-alive
+
+<html>… nginx welcome page …</html>
+```
+
+Critical properties:
+- **No `X-Transcend-Version`, `X-CSTP-*`, `X-DTLS-*`, `X-S-*`, `X-D-*`, `webvpn*` headers**. The decoy path bypasses `send_headers()` in `worker-http-handlers.c` entirely.
+- **No `200 CONNECTED`**. Uses `200 OK`.
+- **Server header matches a stock nginx 1.24 default install** (see `CAMOUFLAGE_DECOY_SERVER` in `vpn.h`).
+- **`Date` header is computed per-response** using `strftime("%a, %d %b %Y %H:%M:%S GMT", …)` (RFC 7231 IMF-fixdate).
+- **Body byte-identical to nginx default `index.html`** (`DECOY_INDEX_HTML` in `worker-camouflage.c`).
+- **404 body matches nginx default 404** (`DECOY_404_HTML`), including the `<hr><center>nginx/1.24.0</center>` footer.
+
+Optional static-file serving:
+- Setting `camouflage-decoy-dir = /path/to/html` makes the worker try to serve files from that directory as the decoy. Path traversal (`..`) and query strings are stripped. Falls back to the built-in welcome page if the file does not exist.
+
+**Client impact:** A client that does NOT know the secret auth path (REQ-1.2) will see the decoy — this is by design. A compliant client ALWAYS prefixes every VPN request with the secret path, and therefore never hits the decoy.
+
+### 13.2 REQ-1.2 Secret-Path Auth Trigger
+
+At camouflage level ≥ 2, all VPN URLs must be prefixed with a secret path. The prefix is configured server-side:
+
+```ini
+camouflage-auth-path = /s3cr3t/portal
+```
+
+Dispatch logic (in `vpn_server()` in `worker-vpn.c`):
+
+```
+if camouflage >= 2:
+    marker = camouflage_check_auth_marker(ws)
+    if marker == 0:       # URL does not start with /s3cr3t/portal
+        send decoy
+        continue listening for keep-alive
+    # marker == 1: URL is stripped to its canonical form, dispatch normally
+```
+
+The marker check is implemented in `camouflage_check_auth_marker()` (worker-camouflage.c). The comparison rules are:
+
+1. The requested URL must start with the configured prefix.
+2. The character immediately after the prefix must be `/`, `?`, or end-of-string.
+3. On match, the prefix is stripped from `ws->req.url` via `memmove()` so downstream handlers see the canonical URL (`/auth`, `/api/v1/session`, `/cert.pem`, etc).
+4. A bare marker (e.g. `/s3cr3t/portal`) is rewritten to `/`.
+
+**Client rewriting rules** — every request the client would normally send must be prefixed:
+
+| Canonical URL        | Client sends                     |
+|----------------------|----------------------------------|
+| `/`                  | `/s3cr3t/portal/`                |
+| `/auth`              | `/s3cr3t/portal/auth`            |
+| `/api/v1/session`    | `/s3cr3t/portal/api/v1/session`  |
+| `/cert.pem`          | `/s3cr3t/portal/cert.pem`        |
+| `/1/index.html`      | `/s3cr3t/portal/1/index.html`    |
+
+The client MUST NOT send the canonical URL directly — the server will treat it as a probe and serve the decoy.
+
+**Secret distribution:** the `camouflage-auth-path` value is expected to be shared out-of-band between server and client (typically bundled with the `camouflage-secret`). Treat it as a long-lived credential. Recommended minimum length 16 characters.
+
+### 13.3 REQ-1.3 TLS Handshake Replay Detection
+
+Implementation: `camouflage_is_replay()` in `worker-camouflage.c`.
+
+TSPU probes often record a real TLS handshake from a legitimate client and replay it against other IPs. The replay causes the server to respond with cryptographic material derived from the recorded ClientHello's randomness — a distinctive signature that DPI can detect.
+
+Defense:
+1. After `gnutls_handshake()` succeeds, the worker calls `gnutls_session_get_random()` to extract the TLS client random (32 bytes).
+2. It computes `SHA256(client_random)[0..15]` as a 128-bit fingerprint.
+3. A per-worker rolling hash table (default 4096 entries, 10-minute expiry) is scanned for the fingerprint.
+4. On hit → `ws->camo_probe_detected = 1`, and the worker serves the decoy for the entire HTTP session.
+5. On miss → insert into the table, proceed normally.
+
+Configuration:
+- Enabled by default at level 2 (set automatically in `parse_cfg_file()` in `config.c`).
+- Disable with `camouflage-replay-detect = false`.
+
+**Table sizing:** 4096 entries × 24 bytes ≈ 96 KB per worker. The table is process-local (no shared memory), so a legitimate client reconnecting across different worker processes will not collide. The point is not to block global replay — it is to defeat burst probing against a single target.
+
+**Client impact:** None. A compliant client generates a fresh TLS client random on every connection (as GnuTLS/OpenSSL do by default). Only replayed handshakes collide with the table.
+
+### 13.4 Probe Interaction with Keep-Alive
+
+The decoy handler keeps the TCP/TLS connection alive after serving the response (`Connection: keep-alive`, and `goto restart` in the dispatch loop). This matches nginx behavior: after the first response, the probe can send additional requests on the same connection, and they all get the decoy treatment. Closing immediately would itself be a distinguishing signal.
+
+### 13.5 Testing
+
+Two test scripts under `tests/`:
+
+- `camouflage-active-probe` — probes the server with `curl` and `openssl s_client`. Verifies nginx-shaped headers, absence of VPN markers, 404 handling, and raw-TLS-layer cleanliness.
+- `camouflage-probe-secret` — verifies that a request without the marker hits the decoy, a partial marker still hits the decoy, and only the exact marker unmasks the auth endpoint.
+
+The workflow file `.github/workflows/camouflage-test.yml` runs both jobs on the self-hosted runner as `test-active-probe` and `test-probe-secret`.
+
+### 13.6 New source file / prototypes
+
+- `src/worker-camouflage.c` — new compilation unit for REQ-1 logic.
+- `src/worker.h` — prototypes: `camouflage_send_decoy()`, `camouflage_check_auth_marker()`, `camouflage_is_replay()`. New field: `ws->camo_probe_detected`.
+- `src/vpn.h` — constants: `CAMOUFLAGE_DECOY_SERVER`, `CAMOUFLAGE_REPLAY_TABLE_SIZE`. New config fields on `cfg_st`: `camouflage_auth_path`, `camouflage_decoy_dir`, `camouflage_decoy_upstream`, `camouflage_replay_detect`.
+- `src/config.c` — parsing for the new options; level-2 validation warns if `camouflage-auth-path` is unset.
+- `src/worker-vpn.c` — dispatch: replay check at end of handshake, marker check at top of request handling, decoy fallback on 404.
+- `src/worker-privs.c` — seccomp allows `stat`/`open` syscalls when `camouflage-decoy-dir` is set.
+- `src/Makefile.am` — `worker-camouflage.c` added to `ocserv_worker_SOURCES`.
+
 ---
 
 ## Client Implementation Checklist
@@ -468,21 +602,34 @@ Added `futex` syscall to the seccomp whitelist. Required because ALPN, HMAC, and
 - [ ] Do NOT send/expect banner headers
 - [ ] Accept and discard fake keepalive packets (AC_PKT_KEEPALIVE with random payload)
 
+### REQ-1 Active Probing Protection (required for level 2):
+- [ ] Prefix every HTTP URL with the configured `camouflage-auth-path`
+      (e.g. `/s3cr3t/portal/auth` instead of `/auth`)
+- [ ] Prefix the tunnel URL too: `/s3cr3t/portal/api/v1/session`
+- [ ] Treat a response with `Server: nginx/1.24.0` as "probing protection
+      engaged, your secret is wrong" — do not retry on the same connection,
+      rotate the secret out-of-band
+- [ ] Treat a response body starting with `<!DOCTYPE html>\n<html>\n<head>\n<title>Welcome to nginx!</title>` as the decoy — abort immediately
+- [ ] Always generate fresh TLS client randoms per connection (never reuse)
+      — the server may reject connections with repeated client randoms
+
 ---
 
 ## File Reference
 
 | File | What changed |
 |------|-------------|
-| `src/vpn.h` | Constants: CAMOUFLAGE_OFF/DEFAULT/FULL, cookie names, URLs, server name |
-| `src/config.c` | Config parsing: camouflage, camouflage-secret, camouflage-tunnel-url, TLS priority |
-| `src/worker.h` | New fields: cstp_magic[4], camo_pkt_count, camo_last_fake_keepalive |
-| `src/worker-vpn.c` | CSTP magic init, ALPN, header prefixes, tunnel URL, timing, DPD, keepalives, banners |
+| `src/vpn.h` | Constants: CAMOUFLAGE_OFF/DEFAULT/FULL, cookie names, URLs, server name, CAMOUFLAGE_DECOY_SERVER, CAMOUFLAGE_REPLAY_TABLE_SIZE, REQ-1 config fields |
+| `src/config.c` | Config parsing: camouflage, camouflage-secret, camouflage-tunnel-url, TLS priority, camouflage-auth-path, camouflage-decoy-dir, camouflage-decoy-upstream, camouflage-replay-detect |
+| `src/worker.h` | New fields: cstp_magic[4], camo_pkt_count, camo_last_fake_keepalive, camo_probe_detected. Prototypes: camouflage_send_decoy, camouflage_check_auth_marker, camouflage_is_replay |
+| `src/worker-vpn.c` | CSTP magic init, ALPN, header prefixes, tunnel URL, timing, DPD, keepalives, banners, replay check after handshake, marker check + decoy fallback in dispatch |
 | `src/worker-auth.c` | XML obfuscation, cookie names, header suppression, banner suppression |
 | `src/worker-http-handlers.c` | X-Transcend-Version suppression, header mapping |
 | `src/worker-http.c` | Camouflaged header name → enum mapping (X-S-*, X-D-*) |
+| `src/worker-camouflage.c` | **NEW** REQ-1 decoy handler, secret marker check, TLS replay table |
 | `src/tlslib.c` | TLS record padding via gnutls_record_send_range() |
-| `src/worker-privs.c` | futex syscall added to seccomp whitelist |
+| `src/worker-privs.c` | futex syscall added to seccomp whitelist, stat/open for decoy-dir |
+| `src/Makefile.am` | worker-camouflage.c registered in ocserv_worker_SOURCES |
 
 ---
 
@@ -496,3 +643,6 @@ Added `futex` syscall to the seccomp whitelist. Required because ALPN, HMAC, and
 | REALITY SessionID jitter | Session timeout ±120s, DPD/keepalive ±25% | 1+ |
 | VMess AEAD padding | DTLS packet padding to random MTU | 1+ |
 | HeartbeatConn | Fake keepalive (64-512 bytes, every 5-25s) | 1+ |
+| REALITY / VLESS authentication | `camouflage-auth-path` secret prefix | 2 |
+| REALITY fallback to real site | `camouflage-decoy-dir` / built-in nginx page | 2 |
+| Replay resistance (REALITY) | Per-worker TLS client-random replay table | 2 |

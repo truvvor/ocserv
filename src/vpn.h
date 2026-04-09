@@ -62,6 +62,10 @@
 #define CAMOUFLAGE_TUNNEL_URL "/api/v1/session"
 #define CAMOUFLAGE_SERVER_NAME "server"
 
+/* REQ-1 active probing protection */
+#define CAMOUFLAGE_DECOY_SERVER "nginx/1.24.0"
+#define CAMOUFLAGE_REPLAY_TABLE_SIZE 4096
+
 
 typedef enum {
 	SOCK_TYPE_TCP,
@@ -298,6 +302,11 @@ struct cfg_st {
 	unsigned camouflage; /* DPI evasion level: 0=off, 1=server-only, 2=full */
 	char *camouflage_tunnel_url; /* custom tunnel URL for camouflage mode */
 	char *camouflage_secret; /* secret for deriving obfuscation parameters */
+	/* Active probing protection (REQ-1) */
+	char *camouflage_auth_path; /* secret URL path that unmasks the VPN auth endpoint */
+	char *camouflage_decoy_dir; /* directory with static files served as decoy */
+	char *camouflage_decoy_upstream; /* optional upstream URL to proxy to (reserved) */
+	unsigned camouflage_replay_detect; /* enable TLS replay detection */
 
 	unsigned isolate; /* whether seccomp should be enabled or not */
 

@@ -941,6 +941,20 @@ void vpn_server(struct worker_st *ws)
 			oclog(ws, LOG_INFO,
 			      "camouflage: TLS record randomization active");
 		}
+
+		/* REQ-1.3: detect TLS handshake replays. If the same TLS
+		 * client-random has been seen recently, demote this connection
+		 * to the decoy path so the probe cannot distinguish us from a
+		 * stock HTTPS server. We flag the state here, but the actual
+		 * decoy response is served inside the HTTP dispatch loop below
+		 * so the full request (including Host/User-Agent) is read
+		 * before we respond. */
+		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL && session != NULL &&
+		    camouflage_is_replay(ws)) {
+			oclog(ws, LOG_INFO,
+			      "camouflage: TLS replay detected, serving decoy");
+			ws->camo_probe_detected = 1;
+		}
 	} else {
 		ws->vhost = find_vhost(ws->vconfig, NULL);
 
@@ -1001,12 +1015,46 @@ void vpn_server(struct worker_st *ws)
 		}
 	} while (ws->req.headers_complete == 0);
 
+	/* REQ-1: active probing protection. When camouflage >= 2, all
+	 * incoming HTTP requests are gated on a secret URL-path marker.
+	 * Requests without the marker are served the nginx-mimicking decoy
+	 * page and the VPN endpoints stay invisible. A replay-detected
+	 * connection is always demoted to decoy regardless of URL. */
+	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL) {
+		int marker;
+
+		if (ws->camo_probe_detected) {
+			oclog(ws, LOG_HTTP_DEBUG,
+			      "camouflage: probe detected, serving decoy for %s",
+			      ws->req.url);
+			camouflage_send_decoy(ws, parser.http_minor, 0);
+			goto finish;
+		}
+
+		marker = camouflage_check_auth_marker(ws);
+		if (marker == 0) {
+			oclog(ws, LOG_HTTP_DEBUG,
+			      "camouflage: missing auth marker, serving decoy for %s",
+			      ws->req.url);
+			camouflage_send_decoy(ws, parser.http_minor,
+					      strcmp(ws->req.url, "/") != 0);
+			/* Keep connection alive so the probe sees a normal
+			 * nginx session. */
+			if (parser.http_major == 1 && parser.http_minor >= 1)
+				goto restart;
+			goto finish;
+		}
+	}
+
 	if (parser.method == HTTP_GET) {
 		oclog(ws, LOG_HTTP_DEBUG, "HTTP GET %s", ws->req.url);
 		fn = http_get_url_handler(ws->req.url);
 		if (fn == NULL) {
 			oclog(ws, LOG_HTTP_DEBUG, "unexpected URL %s", ws->req.url);
-			response_404(ws, parser.http_minor);
+			if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+				camouflage_send_decoy(ws, parser.http_minor, 1);
+			else
+				response_404(ws, parser.http_minor);
 			goto finish;
 		}
 		ret = fn(ws, parser.http_minor);
@@ -1041,7 +1089,10 @@ void vpn_server(struct worker_st *ws)
 		if (fn == NULL) {
 			oclog(ws, LOG_HTTP_DEBUG, "unexpected POST URL %s",
 			      ws->req.url);
-			response_404(ws, parser.http_minor);
+			if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+				camouflage_send_decoy(ws, parser.http_minor, 1);
+			else
+				response_404(ws, parser.http_minor);
 			goto finish;
 		}
 
@@ -1060,7 +1111,10 @@ void vpn_server(struct worker_st *ws)
 	} else {
 		oclog(ws, LOG_HTTP_DEBUG, "unexpected HTTP method %s",
 		      http_method_str(parser.method));
-		response_404(ws, parser.http_minor);
+		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
+			camouflage_send_decoy(ws, parser.http_minor, 1);
+		else
+			response_404(ws, parser.http_minor);
 	}
 
  finish:

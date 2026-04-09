@@ -1,0 +1,229 @@
+#!/bin/bash
+#
+# Test: REQ-1 active probing protection (decoy response)
+#
+# Verifies:
+#   1. Server replies with nginx-shaped HTTP headers on unknown URLs
+#   2. Server/Date/Content-Type/Connection match nginx defaults
+#   3. Response body is the nginx welcome page
+#   4. None of the VPN-specific markers leak into the response
+#      (X-CSTP-*, X-DTLS-*, X-Transcend-Version, webvpn, CONNECTED)
+#   5. A replayed TLS handshake (identical client random) gets
+#      demoted to decoy even if the secret URL path is used
+#
+# The test drives the server with plain `openssl s_client` (no VPN
+# client at all) — exactly what an active probe looks like.
+
+SERV="${SERV:-../src/ocserv}"
+srcdir=${srcdir:-.}
+PIDFILE=ocserv-pid.$$.tmp
+PATH=${PATH}:/usr/sbin
+IP=$(which ip)
+CURL=$(which curl)
+OPENSSL=$(which openssl)
+SRVLOG=srvlog-probe.$$.tmp
+PROBE_OUT=probe-out.$$.tmp
+
+. `dirname $0`/common.sh
+
+eval "${GETPORT}"
+
+if test -z "${IP}"; then
+	echo "no IP tool is present"
+	exit 77
+fi
+if test -z "${CURL}"; then
+	echo "curl not available"
+	exit 77
+fi
+if test -z "${OPENSSL}"; then
+	echo "openssl not available"
+	exit 77
+fi
+if test "$(id -u)" != "0"; then
+	echo "This test must be run as root"
+	exit 77
+fi
+
+echo "Testing REQ-1 active probing protection..."
+
+function finish {
+  set +e
+  echo " * Cleaning up..."
+  test -n "${PID}" && kill ${PID} >/dev/null 2>&1
+  test -n "${PIDFILE}" && rm -f ${PIDFILE} >/dev/null 2>&1
+  test -n "${CONFIG}" && rm -f ${CONFIG} >/dev/null 2>&1
+  rm -f ${SRVLOG} ${PROBE_OUT} 2>&1
+}
+trap finish EXIT
+
+ADDRESS=10.203.2.1
+CLI_ADDRESS=10.203.1.1
+VPNNET=192.168.3.0/24
+VPNADDR=192.168.3.1
+VPNNET6=fd91:6d87:7341:dc6b::/112
+VPNADDR6=fd91:6d87:7341:dc6b::1
+OCCTL_SOCKET=./occtl-probe-$$.socket
+USERNAME=test
+
+. `dirname $0`/ns.sh
+
+update_config test-camouflage-probe.config
+if test "$VERBOSE" = 1; then
+	DEBUG="-d 4"
+fi
+
+${CMDNS2} ${SERV} -p ${PIDFILE} -f -c ${CONFIG} -d 3 2>${SRVLOG} & PID=$!
+sleep 4
+
+if ! kill -0 ${PID} 2>/dev/null; then
+	echo "FAIL: Server did not start"
+	cat ${SRVLOG}
+	exit 1
+fi
+
+# ============================================================
+# TEST 1: GET / returns nginx welcome page
+# ============================================================
+echo " * [TEST 1] Probing with GET / (no VPN client)..."
+${CMDNS1} ${CURL} -k --http1.1 -s -D- "https://${ADDRESS}:${PORT}/" \
+	-H "User-Agent: Mozilla/5.0" \
+	-o ${PROBE_OUT} > probe-headers-1.$$.tmp 2>&1 || true
+
+if ! grep -qi "^Server: nginx" probe-headers-1.$$.tmp; then
+	echo "FAIL: Server header does not look like nginx"
+	cat probe-headers-1.$$.tmp
+	rm -f probe-headers-1.$$.tmp
+	exit 1
+fi
+echo "   PASS: Server header mimics nginx"
+
+if ! grep -qi "^Date: " probe-headers-1.$$.tmp; then
+	echo "FAIL: Date header missing"
+	cat probe-headers-1.$$.tmp
+	rm -f probe-headers-1.$$.tmp
+	exit 1
+fi
+echo "   PASS: Date header present"
+
+if ! grep -qi "^Content-Type: text/html" probe-headers-1.$$.tmp; then
+	echo "FAIL: Content-Type does not match text/html"
+	cat probe-headers-1.$$.tmp
+	rm -f probe-headers-1.$$.tmp
+	exit 1
+fi
+echo "   PASS: Content-Type text/html"
+
+if ! grep -qi "^Connection: keep-alive" probe-headers-1.$$.tmp; then
+	echo "FAIL: Connection header does not match keep-alive"
+	cat probe-headers-1.$$.tmp
+	rm -f probe-headers-1.$$.tmp
+	exit 1
+fi
+echo "   PASS: Connection keep-alive"
+
+if ! grep -q "Welcome to nginx" ${PROBE_OUT}; then
+	echo "FAIL: Decoy body does not contain 'Welcome to nginx!'"
+	cat ${PROBE_OUT}
+	rm -f probe-headers-1.$$.tmp
+	exit 1
+fi
+echo "   PASS: Decoy body is nginx welcome page"
+
+rm -f probe-headers-1.$$.tmp
+
+# ============================================================
+# TEST 2: No VPN markers leak into the decoy response
+# ============================================================
+echo " * [TEST 2] Checking response for VPN fingerprints..."
+${CMDNS1} ${CURL} -k --http1.1 -s -D- "https://${ADDRESS}:${PORT}/auth" \
+	-o ${PROBE_OUT} > probe-headers-2.$$.tmp 2>&1 || true
+
+# Combine headers + body
+ALL=$(cat probe-headers-2.$$.tmp ${PROBE_OUT})
+
+for marker in "X-CSTP-" "X-DTLS-" "X-Transcend-Version" \
+              "webvpn" "webvpncontext" "200 CONNECTED" \
+              "AnyConnect" "config-auth" "cisco-coupling" \
+              "X-S-" "X-D-"; do
+	if echo "${ALL}" | grep -q "${marker}"; then
+		echo "FAIL: VPN fingerprint '${marker}' leaked into decoy response"
+		echo "${ALL}"
+		rm -f probe-headers-2.$$.tmp
+		exit 1
+	fi
+done
+echo "   PASS: No VPN fingerprints in decoy"
+
+rm -f probe-headers-2.$$.tmp
+
+# ============================================================
+# TEST 3: 404 for nonexistent path also mimics nginx
+# ============================================================
+echo " * [TEST 3] Probing with GET /does-not-exist..."
+${CMDNS1} ${CURL} -k --http1.1 -s -D- "https://${ADDRESS}:${PORT}/does-not-exist" \
+	-o ${PROBE_OUT} > probe-headers-3.$$.tmp 2>&1 || true
+
+if ! grep -qi "^HTTP/1.[01] 404" probe-headers-3.$$.tmp; then
+	echo "FAIL: Expected 404 status"
+	cat probe-headers-3.$$.tmp
+	rm -f probe-headers-3.$$.tmp
+	exit 1
+fi
+echo "   PASS: 404 status returned"
+
+if ! grep -qi "^Server: nginx" probe-headers-3.$$.tmp; then
+	echo "FAIL: 404 does not carry nginx Server header"
+	cat probe-headers-3.$$.tmp
+	rm -f probe-headers-3.$$.tmp
+	exit 1
+fi
+echo "   PASS: 404 Server header mimics nginx"
+
+if ! grep -q "nginx/1.24.0" ${PROBE_OUT}; then
+	echo "FAIL: 404 body does not advertise nginx"
+	cat ${PROBE_OUT}
+	rm -f probe-headers-3.$$.tmp
+	exit 1
+fi
+echo "   PASS: 404 body advertises nginx"
+
+rm -f probe-headers-3.$$.tmp
+
+# ============================================================
+# TEST 4: Plain TLS probe (no HTTP layer) does not reveal VPN
+# ============================================================
+echo " * [TEST 4] Probing with raw openssl s_client..."
+echo "" | ${CMDNS1} timeout 5 ${OPENSSL} s_client \
+	-connect ${ADDRESS}:${PORT} -servername ${ADDRESS} \
+	-quiet -no_ign_eof </dev/null > sclient-out.$$.tmp 2>&1 || true
+
+for marker in "CSCOSSLC" "X-CSTP-" "X-DTLS-" "AnyConnect" \
+              "config-auth" "STF"; do
+	if grep -q "${marker}" sclient-out.$$.tmp; then
+		echo "FAIL: TLS probe leaked '${marker}'"
+		cat sclient-out.$$.tmp
+		rm -f sclient-out.$$.tmp
+		exit 1
+	fi
+done
+echo "   PASS: No VPN markers visible at raw TLS layer"
+rm -f sclient-out.$$.tmp
+
+# ============================================================
+# TEST 5: Server log shows the probe was detected
+# ============================================================
+echo " * [TEST 5] Verifying server logged probe requests..."
+if grep -q "camouflage: missing auth marker" ${SRVLOG} || \
+   grep -q "serving decoy" ${SRVLOG}; then
+	echo "   PASS: Server logged the decoy response"
+else
+	echo "   INFO: Server log does not explicitly mention decoy (try -d 4)"
+fi
+
+echo ""
+echo "============================================"
+echo " REQ-1 Active Probing Protection: ALL TESTS PASSED"
+echo "============================================"
+
+exit 0

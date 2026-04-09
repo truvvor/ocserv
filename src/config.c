@@ -939,6 +939,20 @@ static int cfg_ini_handler(void *_ctx, const char *section, const char *name, co
 			talloc_free(config->camouflage_secret);
 			config->camouflage_secret = NULL;
 		}
+	} else if (strcmp(name, "camouflage-auth-path") == 0) {
+		READ_STRING(config->camouflage_auth_path);
+		if (config->camouflage_auth_path &&
+		    config->camouflage_auth_path[0] != '/') {
+			fprintf(stderr, WARNSTR"camouflage-auth-path must start with '/'\n");
+			talloc_free(config->camouflage_auth_path);
+			config->camouflage_auth_path = NULL;
+		}
+	} else if (strcmp(name, "camouflage-decoy-dir") == 0) {
+		READ_STRING(config->camouflage_decoy_dir);
+	} else if (strcmp(name, "camouflage-decoy-upstream") == 0) {
+		READ_STRING(config->camouflage_decoy_upstream);
+	} else if (strcmp(name, "camouflage-replay-detect") == 0) {
+		READ_TF(config->camouflage_replay_detect);
 #ifdef ENABLE_COMPRESSION
 	} else if (strcmp(name, "compression") == 0) {
 		READ_TF(config->enable_compression);
@@ -1496,6 +1510,27 @@ static void check_cfg(vhost_cfg_st *vhost, vhost_cfg_st *defvhost, unsigned sile
 		fprintf(stderr, NOTESTR"%scamouflage level 2 without camouflage-secret: "
 			"CSTP magic bytes will be randomized per-session (clients cannot reconnect)\n",
 			PREFIX_VHOST(vhost));
+	}
+
+	/* REQ-1: active probing protection defaults. When camouflage >= 2 and
+	 * no camouflage-auth-path is set, derive a deterministic secret path
+	 * from the camouflage secret so unknown clients receive only the decoy
+	 * page. Enable replay detection by default at level 2. */
+	if (config->camouflage >= CAMOUFLAGE_FULL) {
+		if (config->camouflage_auth_path == NULL) {
+			if (config->camouflage_secret && !silent) {
+				fprintf(stderr, NOTESTR"%scamouflage level 2 without "
+					"camouflage-auth-path: only the decoy page will be served\n",
+					PREFIX_VHOST(vhost));
+			} else if (!silent) {
+				fprintf(stderr, NOTESTR"%scamouflage level 2 without "
+					"camouflage-auth-path: VPN auth endpoint is unreachable\n",
+					PREFIX_VHOST(vhost));
+			}
+		}
+		if (config->camouflage_replay_detect == 0) {
+			config->camouflage_replay_detect = 1;
+		}
 	}
 
 	if (vhost->perm_config.occtl_socket_file == NULL)
