@@ -1021,26 +1021,52 @@ void vpn_server(struct worker_st *ws)
 	 * page and the VPN endpoints stay invisible. A replay-detected
 	 * connection is always demoted to decoy regardless of URL. */
 	if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL) {
-		int marker;
+		int marker = -1;
+		int serve_decoy_now = 0;
+		int is_404;
+		int head_only = (parser.method == HTTP_HEAD);
 
 		if (ws->camo_probe_detected) {
 			oclog(ws, LOG_HTTP_DEBUG,
 			      "camouflage: probe detected, serving decoy for %s",
 			      ws->req.url);
-			camouflage_send_decoy(ws, parser.http_minor, 0);
-			goto finish;
+			serve_decoy_now = 1;
+			is_404 = 0;
+		} else {
+			marker = camouflage_check_auth_marker(ws);
+			if (marker == 0) {
+				oclog(ws, LOG_HTTP_DEBUG,
+				      "camouflage: missing auth marker, serving decoy for %s",
+				      ws->req.url);
+				serve_decoy_now = 1;
+				is_404 = (strcmp(ws->req.url, "/") != 0);
+			}
 		}
 
-		marker = camouflage_check_auth_marker(ws);
-		if (marker == 0) {
-			oclog(ws, LOG_HTTP_DEBUG,
-			      "camouflage: missing auth marker, serving decoy for %s",
-			      ws->req.url);
+		if (serve_decoy_now) {
+			/* Drain any pending request body so the connection
+			 * can safely persist (real nginx reads the full
+			 * request before the next keep-alive cycle). */
+			while (ws->req.message_complete == 0) {
+				nrecvd = cstp_recv(ws, ws->buffer,
+						   sizeof(ws->buffer));
+				if (nrecvd <= 0)
+					break;
+				nparsed = http_parser_execute(&parser, &settings,
+							      (void *)ws->buffer,
+							      nrecvd);
+				if (nparsed == 0)
+					break;
+			}
+
 			camouflage_send_decoy(ws, parser.http_minor,
-					      strcmp(ws->req.url, "/") != 0);
-			/* Keep connection alive so the probe sees a normal
-			 * nginx session. */
-			if (parser.http_major == 1 && parser.http_minor >= 1)
+					      is_404, head_only);
+
+			/* Keep-alive on HTTP/1.1 so the probe observes a
+			 * normal persistent nginx session. On HTTP/1.0 or
+			 * a drained connection, close gracefully. */
+			if (parser.http_major == 1 && parser.http_minor >= 1 &&
+			    ws->req.message_complete != 0)
 				goto restart;
 			goto finish;
 		}
@@ -1052,7 +1078,7 @@ void vpn_server(struct worker_st *ws)
 		if (fn == NULL) {
 			oclog(ws, LOG_HTTP_DEBUG, "unexpected URL %s", ws->req.url);
 			if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
-				camouflage_send_decoy(ws, parser.http_minor, 1);
+				camouflage_send_decoy(ws, parser.http_minor, 1, 0);
 			else
 				response_404(ws, parser.http_minor);
 			goto finish;
@@ -1090,7 +1116,7 @@ void vpn_server(struct worker_st *ws)
 			oclog(ws, LOG_HTTP_DEBUG, "unexpected POST URL %s",
 			      ws->req.url);
 			if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
-				camouflage_send_decoy(ws, parser.http_minor, 1);
+				camouflage_send_decoy(ws, parser.http_minor, 1, 0);
 			else
 				response_404(ws, parser.http_minor);
 			goto finish;
@@ -1112,7 +1138,8 @@ void vpn_server(struct worker_st *ws)
 		oclog(ws, LOG_HTTP_DEBUG, "unexpected HTTP method %s",
 		      http_method_str(parser.method));
 		if (WSCAMOUFLAGE(ws) >= CAMOUFLAGE_FULL)
-			camouflage_send_decoy(ws, parser.http_minor, 1);
+			camouflage_send_decoy(ws, parser.http_minor, 1,
+					      parser.method == HTTP_HEAD);
 		else
 			response_404(ws, parser.http_minor);
 	}

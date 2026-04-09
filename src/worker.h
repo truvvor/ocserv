@@ -356,7 +356,8 @@ int response_404(worker_st *ws, unsigned http_ver);
 int get_empty_handler(worker_st *server, unsigned http_ver);
 
 /* REQ-1: active probing protection (worker-camouflage.c) */
-int camouflage_send_decoy(worker_st *ws, unsigned http_ver, int is_404);
+int camouflage_send_decoy(worker_st *ws, unsigned http_ver, int is_404,
+			  int head_only);
 int camouflage_check_auth_marker(worker_st *ws);
 int camouflage_is_replay(worker_st *ws);
 #ifdef ANYCONNECT_CLIENT_COMPAT

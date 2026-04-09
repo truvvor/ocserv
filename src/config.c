@@ -951,6 +951,11 @@ static int cfg_ini_handler(void *_ctx, const char *section, const char *name, co
 		READ_STRING(config->camouflage_decoy_dir);
 	} else if (strcmp(name, "camouflage-decoy-upstream") == 0) {
 		READ_STRING(config->camouflage_decoy_upstream);
+		if (config->camouflage_decoy_upstream) {
+			fprintf(stderr, WARNSTR"camouflage-decoy-upstream is reserved for "
+				"future reverse-proxy support and is currently a no-op; "
+				"the built-in nginx decoy (or camouflage-decoy-dir) will be used\n");
+		}
 	} else if (strcmp(name, "camouflage-replay-detect") == 0) {
 		READ_TF(config->camouflage_replay_detect);
 #ifdef ENABLE_COMPRESSION

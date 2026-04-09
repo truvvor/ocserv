@@ -121,14 +121,122 @@ static void format_http_date(char *buf, size_t buf_size)
 	strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", &tm);
 }
 
+static void format_http_date_from(time_t t, char *buf, size_t buf_size)
+{
+	struct tm tm;
+
+	gmtime_r(&t, &tm);
+	strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+}
+
+/* Nginx-style ETag: "<hex-mtime>-<hex-size>". */
+static void format_etag(time_t mtime, off_t size, char *buf, size_t buf_size)
+{
+	snprintf(buf, buf_size, "\"%lx-%lx\"",
+		 (unsigned long)mtime, (unsigned long)size);
+}
+
+/* Map a file extension to a MIME type. Returns a default of
+ * application/octet-stream for anything unknown, matching nginx's
+ * default_type fallback. Only the few types nginx's mime.types assigns
+ * by default for a fresh install are mapped — enough to look right
+ * against an active prober that fetches CSS/JS/images. */
+static const char *get_mime_type(const char *path)
+{
+	const char *dot = strrchr(path, '.');
+	const char *ext;
+
+	if (dot == NULL || dot[1] == '\0')
+		return "application/octet-stream";
+	ext = dot + 1;
+
+	if (strcasecmp(ext, "html") == 0 || strcasecmp(ext, "htm") == 0)
+		return "text/html";
+	if (strcasecmp(ext, "css") == 0)
+		return "text/css";
+	if (strcasecmp(ext, "js") == 0)
+		return "application/javascript";
+	if (strcasecmp(ext, "json") == 0)
+		return "application/json";
+	if (strcasecmp(ext, "xml") == 0)
+		return "text/xml";
+	if (strcasecmp(ext, "txt") == 0)
+		return "text/plain";
+	if (strcasecmp(ext, "png") == 0)
+		return "image/png";
+	if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0)
+		return "image/jpeg";
+	if (strcasecmp(ext, "gif") == 0)
+		return "image/gif";
+	if (strcasecmp(ext, "svg") == 0)
+		return "image/svg+xml";
+	if (strcasecmp(ext, "ico") == 0)
+		return "image/x-icon";
+	if (strcasecmp(ext, "woff") == 0)
+		return "font/woff";
+	if (strcasecmp(ext, "woff2") == 0)
+		return "font/woff2";
+	if (strcasecmp(ext, "pdf") == 0)
+		return "application/pdf";
+	return "application/octet-stream";
+}
+
+/* Minimal in-place percent-decoder. Handles %NN sequences and rejects
+ * anything that would allow a traversal (null bytes, backslashes).
+ * Returns 0 on success, -1 on malformed input. */
+static int url_path_decode(char *s)
+{
+	char *r = s;
+	char *w = s;
+
+	while (*r != '\0' && *r != '?' && *r != '#') {
+		if (*r == '%') {
+			int hi, lo;
+			unsigned char c;
+			if (r[1] == '\0' || r[2] == '\0')
+				return -1;
+			hi = r[1];
+			lo = r[2];
+			if (hi >= '0' && hi <= '9') hi -= '0';
+			else if (hi >= 'a' && hi <= 'f') hi -= 'a' - 10;
+			else if (hi >= 'A' && hi <= 'F') hi -= 'A' - 10;
+			else return -1;
+			if (lo >= '0' && lo <= '9') lo -= '0';
+			else if (lo >= 'a' && lo <= 'f') lo -= 'a' - 10;
+			else if (lo >= 'A' && lo <= 'F') lo -= 'A' - 10;
+			else return -1;
+			c = (unsigned char)((hi << 4) | lo);
+			if (c == '\0' || c == '\\' || c == '/')
+				/* reject embedded nulls, backslashes and
+				 * encoded slashes — nginx treats %2f as
+				 * a literal inside a segment but we stay
+				 * strict here for path-traversal safety */
+				return -1;
+			*w++ = (char)c;
+			r += 3;
+		} else if (*r == '\\' || *r == '\0') {
+			return -1;
+		} else {
+			*w++ = *r++;
+		}
+	}
+	*w = '\0';
+	return 0;
+}
+
 /* Emit nginx-shaped response headers. Must NOT include any of the
- * VPN-specific headers (X-Transcend-Version, X-CSTP-*, X-S-*, etc). */
+ * VPN-specific headers (X-Transcend-Version, X-CSTP-*, X-S-*, etc).
+ * `st` may be NULL for dynamically-generated responses; if non-NULL,
+ * Last-Modified / ETag / Accept-Ranges are emitted matching the file's
+ * metadata (as real nginx does for static content). */
 static int send_nginx_headers(worker_st *ws, unsigned http_ver,
 			      unsigned status_code, const char *status_text,
 			      const char *content_type, unsigned content_length,
-			      int close_conn)
+			      int close_conn, const struct stat *st)
 {
 	char date_buf[64];
+	char lm_buf[64];
+	char etag_buf[64];
 
 	format_http_date(date_buf, sizeof(date_buf));
 
@@ -142,6 +250,16 @@ static int send_nginx_headers(worker_st *ws, unsigned http_ver,
 		return -1;
 	if (cstp_printf(ws, "Content-Length: %u\r\n", content_length) < 0)
 		return -1;
+	if (st != NULL) {
+		format_http_date_from(st->st_mtime, lm_buf, sizeof(lm_buf));
+		format_etag(st->st_mtime, st->st_size, etag_buf, sizeof(etag_buf));
+		if (cstp_printf(ws, "Last-Modified: %s\r\n", lm_buf) < 0)
+			return -1;
+		if (cstp_printf(ws, "ETag: %s\r\n", etag_buf) < 0)
+			return -1;
+		if (cstp_puts(ws, "Accept-Ranges: bytes\r\n") < 0)
+			return -1;
+	}
 	if (cstp_printf(ws, "Connection: %s\r\n", close_conn ? "close" : "keep-alive") < 0)
 		return -1;
 	if (cstp_puts(ws, "\r\n") < 0)
@@ -151,41 +269,48 @@ static int send_nginx_headers(worker_st *ws, unsigned http_ver,
 
 /* Try to serve a file from camouflage_decoy_dir. Returns 0 on success,
  * -1 if the file cannot be served (caller should fall back to the
- * built-in welcome page). */
+ * built-in welcome page). Honors HEAD by suppressing the body. */
 static int serve_decoy_file(worker_st *ws, unsigned http_ver,
-			    const char *url)
+			    const char *url, int head_only)
 {
 	const char *dir;
 	char path[PATH_MAX];
+	char clean[PATH_MAX];
 	struct stat st;
-	const char *rel;
+	const char *mime;
 	size_t i;
-	int fd;
 	int ret;
 
 	dir = WSCONFIG(ws)->camouflage_decoy_dir;
 	if (dir == NULL)
 		return -1;
 
-	/* sanitize: reject any path containing ".." or null bytes */
 	if (url == NULL || url[0] != '/')
 		return -1;
-	for (i = 0; url[i] != '\0' && url[i] != '?'; i++) {
-		if (url[i] == '.' && url[i + 1] == '.')
+
+	/* Copy the path portion (strip query/fragment) into a mutable
+	 * buffer, then URL-decode it in place. Reject on malformed %NN. */
+	for (i = 0; i < sizeof(clean) - 1 && url[i] != '\0'
+		    && url[i] != '?' && url[i] != '#'; i++)
+		clean[i] = url[i];
+	clean[i] = '\0';
+	if (url_path_decode(clean) < 0)
+		return -1;
+
+	/* Refuse any traversal tokens after decoding. This rejects both
+	 * literal ".." and encoded variants like %2e%2e or .%2e. */
+	for (i = 0; clean[i] != '\0'; i++) {
+		if (clean[i] == '.' && clean[i + 1] == '.')
 			return -1;
 	}
 
-	rel = url + 1; /* skip leading '/' */
-	if (*rel == '\0' || url[i - 1] == '/' || strchr(rel, '?') == rel) {
-		ret = snprintf(path, sizeof(path), "%s/index.html", dir);
+	if (clean[1] == '\0' || clean[strlen(clean) - 1] == '/') {
+		/* directory request → index.html */
+		ret = snprintf(path, sizeof(path), "%s%sindex.html",
+			       dir,
+			       clean[strlen(clean) - 1] == '/' ? clean : "/");
 	} else {
-		/* strip query string */
-		char clean[PATH_MAX];
-		size_t j;
-		for (j = 0; j < sizeof(clean) - 1 && rel[j] != '\0' && rel[j] != '?'; j++)
-			clean[j] = rel[j];
-		clean[j] = '\0';
-		ret = snprintf(path, sizeof(path), "%s/%s", dir, clean);
+		ret = snprintf(path, sizeof(path), "%s%s", dir, clean);
 	}
 	if (ret < 0 || (size_t)ret >= sizeof(path))
 		return -1;
@@ -193,35 +318,38 @@ static int serve_decoy_file(worker_st *ws, unsigned http_ver,
 	if (stat(path, &st) != 0 || !S_ISREG(st.st_mode))
 		return -1;
 
-	fd = open(path, O_RDONLY);
-	if (fd < 0)
-		return -1;
-	close(fd);
+	mime = get_mime_type(path);
 
 	cstp_cork(ws);
-	if (send_nginx_headers(ws, http_ver, 200, "OK", "text/html",
-			       (unsigned)st.st_size, 0) < 0) {
+	if (send_nginx_headers(ws, http_ver, 200, "OK", mime,
+			       (unsigned)st.st_size, 0, &st) < 0) {
 		cstp_uncork(ws);
 		return -1;
 	}
-	if (cstp_send_file(ws, path) < 0) {
-		cstp_uncork(ws);
-		return -1;
+	if (!head_only) {
+		if (cstp_send_file(ws, path) < 0) {
+			cstp_uncork(ws);
+			return -1;
+		}
 	}
 	return cstp_uncork(ws);
 }
 
 /* Serve the nginx-mimicking decoy landing page. Use this when a probe
- * hits the listener without the VPN secret marker. */
-int camouflage_send_decoy(worker_st *ws, unsigned http_ver, int is_404)
+ * hits the listener without the VPN secret marker. `head_only` should
+ * be set for HTTP HEAD requests: headers are sent, body is not. */
+int camouflage_send_decoy(worker_st *ws, unsigned http_ver, int is_404,
+			  int head_only)
 {
 	const char *html;
 	unsigned html_len;
 	int ret;
 
-	/* Attempt static file first. */
-	if (!is_404 && ws->req.url[0] != '\0') {
-		if (serve_decoy_file(ws, http_ver, ws->req.url) == 0)
+	/* Attempt to serve a real file from the decoy dir first. Any hit
+	 * overrides the is_404 hint — a matching file is always 200 OK.
+	 * If the file is missing we fall back to the built-in page. */
+	if (ws->req.url[0] != '\0') {
+		if (serve_decoy_file(ws, http_ver, ws->req.url, head_only) == 0)
 			return 0;
 	}
 
@@ -237,12 +365,14 @@ int camouflage_send_decoy(worker_st *ws, unsigned http_ver, int is_404)
 	ret = send_nginx_headers(ws, http_ver,
 				 is_404 ? 404 : 200,
 				 is_404 ? "Not Found" : "OK",
-				 "text/html", html_len, 0);
+				 "text/html", html_len, 0, NULL);
 	if (ret < 0)
 		goto fail;
-	ret = cstp_send(ws, html, html_len);
-	if (ret < 0)
-		goto fail;
+	if (!head_only) {
+		ret = cstp_send(ws, html, html_len);
+		if (ret < 0)
+			goto fail;
+	}
 	return cstp_uncork(ws);
 fail:
 	cstp_uncork(ws);
@@ -264,6 +394,9 @@ int camouflage_check_auth_marker(worker_st *ws)
 	const char *marker;
 	size_t mlen;
 	size_t ulen;
+	unsigned diff = 0;
+	size_t i;
+	char boundary;
 
 	if (WSCAMOUFLAGE(ws) < CAMOUFLAGE_FULL)
 		return -1; /* feature inactive */
@@ -275,14 +408,23 @@ int camouflage_check_auth_marker(worker_st *ws)
 	mlen = strlen(marker);
 	ulen = strlen(ws->req.url);
 
-	if (ulen < mlen)
-		return 0;
-	if (memcmp(ws->req.url, marker, mlen) != 0)
-		return 0;
+	/* Constant-time compare. If the URL is shorter than the marker,
+	 * walk the marker against a zero byte after the URL end so the
+	 * loop always runs mlen iterations — this prevents an attacker
+	 * from inferring the marker length by measuring response latency
+	 * against progressively-longer path prefixes.
+	 */
+	for (i = 0; i < mlen; i++) {
+		unsigned char u = (i < ulen) ? (unsigned char)ws->req.url[i] : 0;
+		diff |= (unsigned)(u ^ (unsigned char)marker[i]);
+	}
 	/* The marker must be followed by '/', '?' or end-of-string. */
-	if (ws->req.url[mlen] != '\0' &&
-	    ws->req.url[mlen] != '/' &&
-	    ws->req.url[mlen] != '?')
+	boundary = (ulen > mlen) ? ws->req.url[mlen] : '\0';
+	if (ulen < mlen)
+		diff |= 1;
+	if (boundary != '\0' && boundary != '/' && boundary != '?')
+		diff |= 1;
+	if (diff != 0)
 		return 0;
 
 	/* Strip the marker prefix so downstream code sees the canonical URL.
